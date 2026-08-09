@@ -225,6 +225,7 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
     /// @notice Default non-refundable scheduler fee charged for each scheduled execution.
     /// @dev Flat 0.01 RITUAL fee per scheduled invocation.
     uint256 public constant DEFAULT_SCHEDULED_EXECUTION_FEE = 10_000_000_000_000_000;
+    address private constant BURN_ADDRESS = 0x000000000000000000000000000000000000dEaD;
 
     /// @notice Minimum maxFeePerGas accepted for newly scheduled calls.
     /// @dev Public Ritual chain base fee has held at 7 wei; this rejects zero-fee griefing without
@@ -1396,7 +1397,7 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
                 "Execution reverted"
             );
 
-            _payProposerTip(priorityFee, gasUsed, feesPaid);
+            _distributeGasFees(priorityFee, gasUsed, effectiveFeePerGas * callSnapshot.gas);
             return; // User pays for gas consumed, but value is refunded
         }
 
@@ -1426,21 +1427,26 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
             feesPaid
         );
 
-        _payProposerTip(priorityFee, gasUsed, feesPaid);
+        _distributeGasFees(priorityFee, gasUsed, effectiveFeePerGas * callSnapshot.gas);
     }
 
-    /// @dev Pay the block proposer the priority-fee tip for the gas a scheduled call actually
+    /// @dev Pay the burn address the base fee and the block proposer the priority-fee tip for gas
     ///      consumed, funded from the fees already collected from the sponsor and held by this
     ///      contract. Scheduled transactions are excluded from the execution layer's default
     ///      EIP-1559 beneficiary reward (see ritual-revm `reward_beneficiary`), so all proposer
-    ///      payment for them is performed here. The payout is capped at `feesPaid` so a scheduled
-    ///      call can never pay the proposer more than the sponsor actually paid — it can never
+    ///      payment for them is performed here. The combined payout is capped at `gasFeeBudget` so a scheduled
+    ///      call can never pay out more than the sponsor-funded callback gas budget — it can never
     ///      mint. `priorityFee * gasUsed` is the same tip the default reward would have paid, but
     ///      metered on the target call's gas rather than the whole system transaction.
-    function _payProposerTip(uint256 priorityFee, uint256 gasUsed, uint256 feesPaid) private {
+    function _distributeGasFees(uint256 priorityFee, uint256 gasUsed, uint256 gasFeeBudget) private {
+        uint256 baseFee = block.basefee * gasUsed;
+        if (baseFee > gasFeeBudget) {
+            baseFee = gasFeeBudget;
+        }
+        payable(BURN_ADDRESS).transfer(baseFee);
         uint256 tip = priorityFee * gasUsed;
-        if (tip > feesPaid) {
-            tip = feesPaid;
+        if (tip > gasFeeBudget - baseFee) {
+            tip = gasFeeBudget - baseFee;
         }
         if (tip != 0) {
             (bool ok,) = block.coinbase.call{value: tip}("");
