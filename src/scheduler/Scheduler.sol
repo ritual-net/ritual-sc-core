@@ -126,9 +126,6 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
     /// @param previousState The call state before force-cancel cleanup
     event CallForceCancelled(uint256 indexed callId, address indexed operator, CallState previousState);
 
-    /// @notice Emitted when the owner updates the fixed scheduled execution fee.
-    event ScheduledExecutionFeeUpdated(uint256 oldFee, uint256 newFee);
-
     /// @notice Emitted when a call is skipped due to insufficient funds
     event CallSkippedInsufficientFunds(
         uint256 indexed callId,
@@ -225,9 +222,6 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
     /// @dev Bounds slot residency so long-lived calls cannot accumulate for years.
     uint256 public constant MAX_LIFESPAN = 10_000;
 
-    /// @notice Default non-refundable scheduler fee charged for each scheduled execution.
-    /// @dev Flat 0.01 RITUAL fee per scheduled invocation.
-    uint256 public constant DEFAULT_SCHEDULED_EXECUTION_FEE = 10_000_000_000_000_000;
     address private constant BURN_ADDRESS = 0x000000000000000000000000000000000000dEaD;
 
     /// @notice Minimum maxFeePerGas accepted for newly scheduled calls.
@@ -410,26 +404,14 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
     function initialize(address _owner) external initializer {
         __Ownable_init(_owner);
         __UUPSUpgradeable_init();
-        _scheduledExecutionFee = DEFAULT_SCHEDULED_EXECUTION_FEE;
-        _scheduledExecutionFeeSet = true;
+        SCHEDULED_RESIDENCY_FEE_PER_BLOCK = 10_000_000_000_000_000;
     }
 
     /// @notice Restricts upgrades to owner only
     function _authorizeUpgrade(address) internal override onlyOwner {}
 
-    /// @notice Current non-refundable fee charged for each scheduled execution.
-    /// @dev Returns the default for already-initialized proxy deployments that predate this storage field.
-    function SCHEDULED_EXECUTION_FEE() public view returns (uint256) {
-        return _scheduledExecutionFeeSet ? _scheduledExecutionFee : DEFAULT_SCHEDULED_EXECUTION_FEE;
-    }
-
-    /// @notice Owner-only setter for the per-execution scheduled transaction fee.
-    /// @dev Allows setting the fee to zero; `_scheduledExecutionFeeSet` disambiguates zero from uninitialized.
-    function setScheduledExecutionFee(uint256 newFee) external onlyOwner {
-        uint256 oldFee = SCHEDULED_EXECUTION_FEE();
-        _scheduledExecutionFee = newFee;
-        _scheduledExecutionFeeSet = true;
-        emit ScheduledExecutionFeeUpdated(oldFee, newFee);
+    function setScheduledResidencyFeePerBlock(uint256 newFee) external onlyOwner {
+        SCHEDULED_RESIDENCY_FEE_PER_BLOCK = newFee;
     }
 
     function setAsyncJobTracker(address _asyncJobTracker) external onlyOwner {
@@ -772,12 +754,15 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
             revert MaxFeePerGasBelowFloor();
         }
 
-        // Scheduled calls are intentionally funded just-in-time: creation only
-        // proves the first execution can be paid, and every later execution
-        // re-checks/consumes balance and allowance. A missed payment evicts the
-        // remaining schedule instead of requiring lifetime escrow up front.
-        uint256 executionFee = SCHEDULED_EXECUTION_FEE();
-        uint256 maxExecutionCost = (maxFeePerGas * gas) + value + executionFee;
+        // Charge slot residency up front, then prove one execution remains affordable.
+        uint256 maxExecutionCost = (maxFeePerGas * gas) + value;
+        uint256 residencyFee = SCHEDULED_RESIDENCY_FEE_PER_BLOCK * (expiryBlock - block.number);
+        if (
+            RITUAL_WALLET.deductScheduledExecutionFeesFrom(sponsor, msg.sender, 0, 0, 0, residencyFee, id)
+                != residencyFee
+        ) {
+            revert InsufficientWalletFunds();
+        }
         if (sponsor != msg.sender && RITUAL_WALLET.allowance(sponsor, msg.sender) < maxExecutionCost) {
             revert UnauthorizedSponsor();
         }
@@ -786,8 +771,6 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         if (RITUAL_WALLET.availableBalance(sponsor) < maxExecutionCost) {
             revert InsufficientWalletFunds();
         }
-
-        // No upfront payment required - wallet-based system
 
         // Allocate a slot at the end of dynamic storage
         uint256 slotIndex = _allocateSlot();
@@ -1295,9 +1278,8 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
 
         // Calculate proper EIP-1559 effective fee for deduction
         uint256 baseFee = block.basefee;
-        uint256 executionFee = SCHEDULED_EXECUTION_FEE();
         if (baseFee > callSnapshot.maxFeePerGas) {
-            uint256 requiredAmount = (baseFee * callSnapshot.gas) + callSnapshot.value + executionFee;
+            uint256 requiredAmount = (baseFee * callSnapshot.gas) + callSnapshot.value;
             uint256 availableAmount = RITUAL_WALLET.availableBalance(callSnapshot.sponsor);
             emit CallSkippedInsufficientFunds(
                 callId, callSnapshot.to, callSnapshot.sponsor, requiredAmount, availableAmount
@@ -1335,13 +1317,7 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
 
         // Deduct execution fees from sponsor's account in system wallet.
         uint256 feesPaid = RITUAL_WALLET.deductScheduledExecutionFeesFrom(
-            callSnapshot.sponsor,
-            callSnapshot.to,
-            effectiveFeePerGas,
-            callSnapshot.gas,
-            callSnapshot.value,
-            executionFee,
-            callId
+            callSnapshot.sponsor, callSnapshot.to, effectiveFeePerGas, callSnapshot.gas, callSnapshot.value, 0, callId
         );
 
         // If wallet deduction failed (insufficient funds), emit event and skip execution
@@ -1350,7 +1326,7 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
             // Insufficient funds for this execution attempt - return to scheduled for retry
             currentCall.state = CallState.SCHEDULED;
             emit CallStateChanged(callId, callSnapshot.to, CallState.EXECUTING, CallState.SCHEDULED);
-            uint256 requiredAmount = (effectiveFeePerGas * callSnapshot.gas) + callSnapshot.value + executionFee;
+            uint256 requiredAmount = (effectiveFeePerGas * callSnapshot.gas) + callSnapshot.value;
             uint256 availableAmount = RITUAL_WALLET.availableBalance(callSnapshot.sponsor);
             emit CallSkippedInsufficientFunds(
                 callId, callSnapshot.to, callSnapshot.sponsor, requiredAmount, availableAmount
@@ -1382,7 +1358,7 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
 
         if (!success) {
             // Calculate actual fee using the same effective fee per gas (no value on failure)
-            uint256 actualFailedCallFee = (effectiveFeePerGas * gasUsed) + executionFee;
+            uint256 actualFailedCallFee = effectiveFeePerGas * gasUsed;
 
             // Refund only the value portion and any excess gas fees. A refund failure is a
             // protocol accounting invariant violation for scheduled system transactions, so
@@ -1412,7 +1388,7 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         }
 
         // Calculate actual fee using the same effective fee per gas
-        uint256 actualCallFee = (effectiveFeePerGas * gasUsed) + callSnapshot.value + executionFee;
+        uint256 actualCallFee = (effectiveFeePerGas * gasUsed) + callSnapshot.value;
 
         // Refund the difference - sponsor only pays for the actual call. A refund failure is
         // block-invalid for the same protocol-accounting reason as the failure path above.
@@ -1607,16 +1583,13 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
     /// @notice Allow ETH deposits to `Scheduler`
     receive() external payable {}
 
-    /// @notice Configured non-refundable fee charged for each scheduled execution.
-    uint256 private _scheduledExecutionFee;
-
-    /// @notice Whether `_scheduledExecutionFee` has been explicitly initialized or set.
-    bool private _scheduledExecutionFeeSet;
+    /// @notice Non-refundable admission fee charged per block of scheduled slot residency.
+    uint256 public SCHEDULED_RESIDENCY_FEE_PER_BLOCK = 10_000_000_000_000_000;
 
     /*//////////////////////////////////////////////////////////////
                             STORAGE GAP
     //////////////////////////////////////////////////////////////*/
 
     /// @dev Reserved storage space for future upgrades
-    uint256[44] private __gap;
+    uint256[45] private __gap;
 }
