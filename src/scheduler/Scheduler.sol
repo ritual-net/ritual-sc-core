@@ -592,28 +592,40 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         bool shouldComplete = _allExecutionIndicesConsumed(callId, call.numCalls);
 
         if (shouldComplete) {
-            _clearBitmap(callId);
-
-            // Mark as completed and clean up
-            call.state = CallState.COMPLETED;
-            emit CallStateChanged(callId, call.to, CallState.EXECUTING, CallState.COMPLETED);
-            emit CallCompleted(
-                callId, call.to, call.sponsor, call.startBlock, call.numCalls, call.frequency, call.numCalls
-            );
-
-            // Free the slot back to the available pool
-            uint256 slotIndex = callToSlot[callId];
-            _freeSlot(slotIndex);
-
-            // Remove the call ID mapping and auxiliary storage
-            delete callToSlot[callId];
-            delete originHash[callId];
-            delete callPredicates[callId];
+            _completeCall(callId, call, CallState.EXECUTING);
         } else {
             // Return to scheduled state for next execution
             call.state = CallState.SCHEDULED;
             emit CallStateChanged(callId, call.to, CallState.EXECUTING, CallState.SCHEDULED);
         }
+    }
+
+    /// @notice Terminal COMPLETED transition: tear down a call whose every execution index
+    ///         has been consumed.
+    /// @dev Shared by the post-execution path (previousState EXECUTING) and the TTL-skip
+    ///      path (previousState SCHEDULED), so both consumers of the last index perform the
+    ///      identical teardown. `call` is a storage pointer into the compactable `slots`
+    ///      array and `_freeSlot` moves slots; the caller must not touch `call` after this
+    ///      returns.
+    /// @param callId The call ID
+    /// @param call The call data
+    /// @param previousState The state the call held immediately before completion
+    function _completeCall(uint256 callId, Call storage call, CallState previousState) internal {
+        _clearBitmap(callId);
+
+        // Mark as completed and clean up
+        call.state = CallState.COMPLETED;
+        emit CallStateChanged(callId, call.to, previousState, CallState.COMPLETED);
+        emit CallCompleted(callId, call.to, call.sponsor, call.startBlock, call.numCalls, call.frequency, call.numCalls);
+
+        // Free the slot back to the available pool
+        uint256 slotIndex = callToSlot[callId];
+        _freeSlot(slotIndex);
+
+        // Remove the call ID mapping and auxiliary storage
+        delete callToSlot[callId];
+        delete originHash[callId];
+        delete callPredicates[callId];
     }
 
     function _snapshotCall(Call storage call) internal view returns (CallExecutionSnapshot memory snap) {
@@ -1273,6 +1285,17 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
             emit CallSkippedTTLExpired(
                 callId, callSnapshot.to, callSnapshot.sponsor, expectedBlock, block.number, callSnapshot.ttl
             );
+
+            // Indices may be consumed out of order, so this skip can fill the LAST outstanding
+            // bit. Run the same completion transition the execution path performs; otherwise the
+            // call would sit SCHEDULED with a full bitmap forever, every index rejecting as
+            // AlreadyExecuted, never reaching a terminal state (Zellic 3.8). Nothing was
+            // executed and no fee was charged: this branch returns before any fee arithmetic,
+            // so completion here records zero gas and zero payment for the skipped index.
+            // No statement may follow: _completeCall frees the slot, invalidating `call`.
+            if (_allExecutionIndicesConsumed(callId, callSnapshot.numCalls)) {
+                _completeCall(callId, call, CallState.SCHEDULED);
+            }
             return;
         }
 
