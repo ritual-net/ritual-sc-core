@@ -209,31 +209,7 @@ contract RitualWallet is IRitualWallet, Initializable, UUPSUpgradeable, OwnableU
         uint64 expiryBlock,
         bytes32[] calldata expiredEscrows
     ) external onlyAuthorized {
-        (bool ok, ReserveFailure reason) = _reserve(sponsor, caller, escrowId, amount, expiryBlock, expiredEscrows);
-        if (!ok) {
-            if (reason == ReserveFailure.ESCROW_ALREADY_EXISTS) {
-                revert EscrowAlreadyExists();
-            }
-            if (reason == ReserveFailure.INVALID_ESCROW_EXPIRY) {
-                revert InvalidEscrowExpiry();
-            }
-            if (reason == ReserveFailure.INSUFFICIENT_ALLOWANCE) {
-                revert InsufficientAllowance();
-            }
-            revert InsufficientBalance();
-        }
-    }
-
-    /// @inheritdoc IRitualWallet
-    function tryReserveFrom(
-        address sponsor,
-        address caller,
-        bytes32 escrowId,
-        uint256 amount,
-        uint64 expiryBlock,
-        bytes32[] calldata expiredEscrows
-    ) external onlyAuthorized returns (bool ok, ReserveFailure reason) {
-        return _reserve(sponsor, caller, escrowId, amount, expiryBlock, expiredEscrows);
+        _reserve(sponsor, caller, escrowId, amount, expiryBlock, expiredEscrows);
     }
 
     function _reserve(
@@ -243,7 +219,7 @@ contract RitualWallet is IRitualWallet, Initializable, UUPSUpgradeable, OwnableU
         uint256 amount,
         uint64 expiryBlock,
         bytes32[] calldata expiredEscrows
-    ) internal returns (bool ok, ReserveFailure reason) {
+    ) internal {
         // The target is handled independently so same-ID recommit never depends on hints.
         _release(escrowId);
 
@@ -262,29 +238,25 @@ contract RitualWallet is IRitualWallet, Initializable, UUPSUpgradeable, OwnableU
         }
 
         if (_exists(escrowId)) {
-            return (false, ReserveFailure.ESCROW_ALREADY_EXISTS);
+            revert EscrowAlreadyExists();
         }
         if (expiryBlock <= block.number) {
-            return (false, ReserveFailure.INVALID_ESCROW_EXPIRY);
+            revert InvalidEscrowExpiry();
         }
 
-        bool consumedAllowance;
+        uint256 currentAllowance;
         if (sponsor != caller) {
-            uint256 currentAllowance = allowance[sponsor][caller];
+            currentAllowance = allowance[sponsor][caller];
             if (currentAllowance < amount) {
-                return (false, ReserveFailure.INSUFFICIENT_ALLOWANCE);
-            }
-            if (currentAllowance != type(uint256).max) {
-                allowance[sponsor][caller] = currentAllowance - amount;
-                consumedAllowance = true;
+                revert InsufficientAllowance();
             }
         }
 
         if (_balances[sponsor] < amount) {
-            if (consumedAllowance) {
-                allowance[sponsor][caller] += amount;
-            }
-            return (false, ReserveFailure.INSUFFICIENT_BALANCE);
+            revert InsufficientBalance();
+        }
+        if (sponsor != caller && currentAllowance != type(uint256).max) {
+            allowance[sponsor][caller] = currentAllowance - amount;
         }
 
         _balances[sponsor] -= amount;
@@ -293,7 +265,6 @@ contract RitualWallet is IRitualWallet, Initializable, UUPSUpgradeable, OwnableU
         _escrows[escrowId] = Escrow({sponsor: sponsor, reserved: amount, paid: 0, expiryBlock: expiryBlock});
 
         emit EscrowReserved(escrowId, sponsor, amount, expiryBlock);
-        return (true, ReserveFailure.NONE);
     }
 
     /// @inheritdoc IRitualWallet

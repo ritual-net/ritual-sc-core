@@ -264,11 +264,11 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
     ///      Enables the block builder to reconstruct TxScheduled without event processing.
     mapping(uint256 => bytes32) public originHash;
 
-    /// @notice AsyncJobTracker authorized to consume scheduled async obligations.
+    /// @notice AsyncJobTracker authorized to mark successful scheduled async admission.
     address public asyncJobTracker;
 
-    /// @notice Terminal reserve-failure markers for scheduled-origin async commitments.
-    mapping(bytes32 => bytes32) public scheduledAsyncReserveFailures;
+    /// @notice Replay-proven terminal cleanup reasons for scheduled async obligations.
+    mapping(bytes32 => bytes32) public scheduledAsyncCleanupReasons;
 
     /*//////////////////////////////////////////////////////////////
                           PREDICATE CONSTANTS
@@ -1139,6 +1139,13 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
     {
         address to = call.to;
         address sponsor = call.sponsor;
+        _cancelScheduledCall(callId, call);
+        emit CallEvictedInsufficientFunds(callId, to, sponsor, requiredAmount, availableAmount);
+    }
+
+    function _cancelScheduledCall(uint256 callId, Call storage call) internal {
+        address to = call.to;
+        address sponsor = call.sponsor;
         uint32 startBlock = call.startBlock;
         uint32 numCalls = call.numCalls;
         uint32 frequency = call.frequency;
@@ -1147,7 +1154,6 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         call.state = CallState.CANCELLED;
         emit CallStateChanged(callId, to, oldState, CallState.CANCELLED);
         emit CallCancelled(callId, to, sponsor, startBlock, numCalls, frequency);
-        emit CallEvictedInsufficientFunds(callId, to, sponsor, requiredAmount, availableAmount);
 
         _clearBitmap(callId);
 
@@ -1404,24 +1410,13 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         );
     }
 
-    /// @dev Scheduled-async bridge: the in-flight path validates the pending index and records
-    ///      AsyncJobTracker admission without consuming the Scheduler bitmap; Reth suppresses duplicate
-    ///      scheduled-async commitments while the async job is active. The evict paths terminally free the
-    ///      call. Restricted to trusted senders and bound to `originHash` via `_validateScheduledAsyncOrigin`.
+    /// @dev Validates and records AsyncJobTracker admission without consuming the Scheduler bitmap.
+    ///      Reth suppresses duplicate commitments while the async job is active.
     function markScheduledAsyncInFlight(uint256 callId, uint256 executionIndex, bytes32 jobId) external {
         _onlyAsyncJobTracker();
         Call storage call = _getCall(callId);
         _validateScheduledAsyncPending(callId, call, executionIndex, jobId);
         emit ScheduledAsyncInFlight(callId, executionIndex, jobId);
-    }
-
-    function evictScheduledAsync(uint256 callId, uint256 executionIndex, bytes32 jobId, bytes32 reason) external {
-        _onlyAsyncJobTracker();
-        Call storage call = _getCall(callId);
-        _validateScheduledAsyncPending(callId, call, executionIndex, jobId);
-        scheduledAsyncReserveFailures[_scheduledAsyncKey(callId, executionIndex)] = reason;
-        _evictInsufficientFunds(callId, call, 0, 0);
-        emit ScheduledAsyncEvicted(callId, executionIndex, jobId, reason);
     }
 
     function cleanupInvalidScheduledAsync(uint256 callId, uint256 executionIndex, bytes32 jobId, bytes32 reason)
@@ -1432,13 +1427,13 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         }
         Call storage call = _getCall(callId);
         _validateScheduledAsyncPending(callId, call, executionIndex, jobId);
-        scheduledAsyncReserveFailures[_scheduledAsyncKey(callId, executionIndex)] = reason;
-        _evictInsufficientFunds(callId, call, 0, 0);
+        scheduledAsyncCleanupReasons[_scheduledAsyncKey(callId, executionIndex)] = reason;
+        _cancelScheduledCall(callId, call);
         emit ScheduledAsyncEvicted(callId, executionIndex, jobId, reason);
     }
 
-    function scheduledAsyncReserveFailure(uint256 callId, uint256 executionIndex) external view returns (bytes32) {
-        return scheduledAsyncReserveFailures[_scheduledAsyncKey(callId, executionIndex)];
+    function scheduledAsyncCleanupReason(uint256 callId, uint256 executionIndex) external view returns (bytes32) {
+        return scheduledAsyncCleanupReasons[_scheduledAsyncKey(callId, executionIndex)];
     }
 
     /// @notice Expire a single SCHEDULED call and release all of its storage

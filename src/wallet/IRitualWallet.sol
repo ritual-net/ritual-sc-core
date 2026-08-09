@@ -8,14 +8,6 @@ pragma solidity ^0.8.28;
 /// @title IRitualWallet
 /// @notice Interface for ritual wallet escrow system
 interface IRitualWallet {
-    enum ReserveFailure {
-        NONE,
-        INSUFFICIENT_BALANCE,
-        INSUFFICIENT_ALLOWANCE,
-        ESCROW_ALREADY_EXISTS,
-        INVALID_ESCROW_EXPIRY
-    }
-
     /// @dev Lifecycle is derived from presence and `block.number`: absent is reusable,
     ///      present through `expiryBlock` is live, and present after it is reclaimable.
     ///      Expiry and final settlement delete the record.
@@ -155,17 +147,6 @@ interface IRitualWallet {
         uint64 expiryBlock,
         bytes32[] calldata expiredEscrows
     ) external;
-
-    /// @notice Non-reverting reserve path for scheduled async commitments.
-    /// @dev Economic/setup failures are returned; authorization failures still revert.
-    function tryReserveFrom(
-        address sponsor,
-        address caller,
-        bytes32 escrowId,
-        uint256 amount,
-        uint64 expiryBlock,
-        bytes32[] calldata expiredEscrows
-    ) external returns (bool ok, ReserveFailure reason);
 
     /// @notice Settle an active escrow. If `close` is false and `newExpiry` is zero, the existing expiry is kept.
     /// @dev Restricted in the implementation to authorized protocol contracts: Scheduler, AsyncDelivery, and AsyncJobTracker.

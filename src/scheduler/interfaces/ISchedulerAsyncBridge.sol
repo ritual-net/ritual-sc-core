@@ -3,6 +3,4 @@ pragma solidity ^0.8.28;
 
 interface ISchedulerAsyncBridge {
     function markScheduledAsyncInFlight(uint256 callId, uint256 executionIndex, bytes32 jobId) external;
-
-    function evictScheduledAsync(uint256 callId, uint256 executionIndex, bytes32 jobId, bytes32 reason) external;
 }
