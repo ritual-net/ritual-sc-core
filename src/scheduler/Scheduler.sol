@@ -210,12 +210,8 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
     /// @notice TX_HASH precompile address — returns the hash of the currently executing transaction
     address private constant TX_HASH_PRECOMPILE = 0x0000000000000000000000000000000000000830;
 
-    /// @notice Threshold for triggering automatic cleanup (number of slots)
-    /// @dev If slots.length exceeds this threshold, cleanup is triggered during execution
-    uint256 private constant CLEANUP_THRESHOLD = 1000;
-
-    /// @dev Maximum items to clean per cleanup call (gas bound: 25 × ~280K = 7M gas)
-    uint256 private constant MAX_CLEANUP_PER_EXECUTE = 25;
+    /// @notice Maximum number of explicit cleanup IDs assigned to one scheduled execution.
+    uint256 public constant MAX_CLEANUP_BATCH = 25;
 
     /// @notice Maximum number of executions per scheduled call.
     /// @dev The scheduler tracks consumed execution indices in one 256-bit bitmap. `MAX_LIFESPAN`
@@ -376,6 +372,9 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
 
     /// @notice Thrown when a schedule would remain resident longer than MAX_LIFESPAN
     error ScheduleLifespanExceeded();
+
+    /// @notice Thrown when an explicit cleanup batch has an invalid size
+    error InvalidCleanupBatchSize();
 
     /// @notice Thrown when maxFeePerGas is below the network floor for scheduled calls
     error MaxFeePerGasBelowFloor();
@@ -1175,17 +1174,33 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
     ///      variable times. Reth owns canonical scheduled transaction body matching and duplicate/window
     ///      validity, but does not require index `n - 1` to complete before index `n`.
     function execute(uint256 callId, uint256 executionIndex) external payable {
-        // Restrict to only system account
+        _execute(callId, executionIndex);
+    }
+
+    /// @notice Executes a call after reclaiming a bounded batch of explicitly selected expired slots.
+    /// @param callId `Call` to execute
+    /// @param executionIndex Which execution this is (0-based for recurring calls)
+    /// @param cleanupCallIds Explicit call IDs to check for expiry before executing `callId`
+    /// @dev An empty batch is valid. Cleanup completes before `_execute` resolves `callId`,
+    ///      because dense slot compaction may move the target call.
+    function execute(uint256 callId, uint256 executionIndex, uint256[] calldata cleanupCallIds) external payable {
+        if (cleanupCallIds.length > MAX_CLEANUP_BATCH) {
+            revert InvalidCleanupBatchSize();
+        }
+        // The target must remain available for `_execute`, which owns its normal
+        // expiry and execution semantics.
+        _cleanupExpiredCallsByIds(cleanupCallIds, callId, true);
+        _execute(callId, executionIndex);
+    }
+
+    function _execute(uint256 callId, uint256 executionIndex) internal {
+        // Any cleanup above rolls back atomically if the caller is unauthorized.
         if (msg.sender != SYSTEM_ACCOUNT) {
             revert SenderNotSystemAccount();
         }
 
-        // Check if cleanup threshold is exceeded and trigger cleanup if needed
-        if (slots.length > CLEANUP_THRESHOLD) {
-            _cleanupExpiredCallsScan();
-        }
-
-        // Get the scheduled call from circular buffer
+        // Resolve only the requested call. Scheduled execution must never scan
+        // unrelated slots.
         Call storage call = _getCall(callId);
         // Snapshot fields used after target-controlled execution. The storage
         // reference may be stale after reentrant Scheduler calls move slots.
@@ -1437,9 +1452,7 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
     }
 
     /// @notice Expire a single SCHEDULED call and release all of its storage
-    /// @dev Shared terminal cleanup for both the scan-all and explicit-id paths. Assumes the caller has
-    ///      already confirmed the call is expired. After `_freeSlot` the freed slot index is reused by the
-    ///      swapped-in call, so scan callers must not advance their cursor past this index.
+    /// @dev Assumes the caller has already confirmed the call is expired.
     function _expireCall(uint256 callId, uint256 slotIndex, Call storage call, uint256 expiryBlock) internal {
         _clearBitmap(callId);
 
@@ -1457,45 +1470,32 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         delete callPredicates[callId];
     }
 
-    /// @notice Scan the dense slots array and expire any calls past their implicit expiry
-    /// @dev Gas-bounded by MAX_CLEANUP_PER_EXECUTE. Used by the privileged execute() opportunistic sweep.
-    function _cleanupExpiredCallsScan() internal {
-        uint256 cleaned = 0;
-        for (uint256 i = 0; i < slots.length && cleaned < MAX_CLEANUP_PER_EXECUTE;) {
-            Call storage call = slots[i];
-            if (call.to != address(0) && call.state == CallState.SCHEDULED) {
+    /// @notice Expire one explicitly selected call if it is past its implicit expiry.
+    /// @dev Missing, terminal, unexpired, and non-SCHEDULED call IDs are idempotent no-ops.
+    function _cleanupExpiredCallById(uint256 callId) internal {
+        uint256 slotIndex = callToSlot[callId];
+        if (slotIndex < slots.length) {
+            Call storage call = slots[slotIndex];
+            if (call.callId == callId && call.to != address(0)) {
                 uint256 expiryBlock = _calculateExpiryBlock(call.startBlock, call.frequency, call.numCalls, call.ttl);
-                if (block.number > expiryBlock) {
-                    _expireCall(call.callId, i, call, expiryBlock);
-                    // Slot was freed, so current index now points to a different call
-                    // Continue without incrementing to check the new call at this index
-                    cleaned++;
-                    continue;
+                if (block.number > expiryBlock && call.state == CallState.SCHEDULED) {
+                    _expireCall(callId, slotIndex, call, expiryBlock);
                 }
-            }
-            unchecked {
-                ++i;
             }
         }
     }
 
-    /// @notice Expire the given call IDs if they are past their implicit expiry
-    /// @dev Iterates `callIds` directly in calldata (no memory copy); caller controls gas via array size.
-    function _cleanupExpiredCallsByIds(uint256[] calldata callIds) internal {
+    /// @notice Expire the given call IDs if they are past their implicit expiry.
+    /// @param protectedCallId Call ID to skip when `protectCallId` is true.
+    /// @param protectCallId Whether to leave `protectedCallId` for subsequent execution.
+    function _cleanupExpiredCallsByIds(uint256[] calldata callIds, uint256 protectedCallId, bool protectCallId)
+        internal
+    {
         uint256 n = callIds.length;
         for (uint256 i = 0; i < n;) {
-            uint256 callId = callIds[i];
-            uint256 slotIndex = callToSlot[callId];
-            if (slotIndex < slots.length) {
-                Call storage call = slots[slotIndex];
-                if (call.callId == callId && call.to != address(0)) {
-                    // Check if call is expired (implicit expiry)
-                    uint256 expiryBlock =
-                        _calculateExpiryBlock(call.startBlock, call.frequency, call.numCalls, call.ttl);
-                    if (block.number > expiryBlock && call.state == CallState.SCHEDULED) {
-                        _expireCall(callId, slotIndex, call, expiryBlock);
-                    }
-                }
+            uint256 cleanupCallId = callIds[i];
+            if (!protectCallId || cleanupCallId != protectedCallId) {
+                _cleanupExpiredCallById(cleanupCallId);
             }
             unchecked {
                 ++i;
@@ -1503,14 +1503,13 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         }
     }
 
-    /// @notice Clean up expired calls (external wrapper)
-    /// @param callIds Array of call IDs to check and clean up if expired. If empty, scans all slots.
+    /// @notice Clean up caller-supplied expired calls by explicit ID
+    /// @param callIds Explicit call IDs to check and clean up if expired
     function cleanupExpiredCalls(uint256[] calldata callIds) external {
         if (callIds.length == 0) {
-            _cleanupExpiredCallsScan();
-        } else {
-            _cleanupExpiredCallsByIds(callIds);
+            revert InvalidCleanupBatchSize();
         }
+        _cleanupExpiredCallsByIds(callIds, 0, false);
     }
 
     /// @notice Get the current state of a call
