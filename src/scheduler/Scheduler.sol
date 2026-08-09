@@ -667,16 +667,6 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         }
     }
 
-    function _consumeScheduledAsyncIndex(uint256 callId, Call storage call, uint256 executionIndex, bytes32 jobId)
-        internal
-    {
-        _validateScheduledAsyncPending(callId, call, executionIndex, jobId);
-        call.state = CallState.EXECUTING;
-        emit CallStateChanged(callId, call.to, CallState.SCHEDULED, CallState.EXECUTING);
-        _markExecuted(callId, executionIndex);
-        _handlePostExecution(callId, call, executionIndex, true);
-    }
-
     function _scheduledAsyncJobId(uint256 callId, uint256 executionIndex) internal view returns (bytes32) {
         bytes32 origin = originHash[callId];
         if (origin == bytes32(0)) {
@@ -1414,10 +1404,10 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         );
     }
 
-    /// @dev Scheduled-async bridge: these consume/evict an index outside `execute()`'s
-    ///      predicate/TTL/payment/target-call flow (`markScheduledAsyncInFlight` shares the same
-    ///      `executedBitmap`; the evict paths free the call). Restricted to trusted senders and bound to
-    ///      `originHash` via `_validateScheduledAsyncOrigin`; commitment validity is enforced in Reth.
+    /// @dev Scheduled-async bridge: the in-flight path validates the pending index and records
+    ///      AsyncJobTracker admission without consuming the Scheduler bitmap; Reth suppresses duplicate
+    ///      scheduled-async commitments while the async job is active. The evict paths terminally free the
+    ///      call. Restricted to trusted senders and bound to `originHash` via `_validateScheduledAsyncOrigin`.
     function markScheduledAsyncInFlight(uint256 callId, uint256 executionIndex, bytes32 jobId) external {
         _onlyAsyncJobTracker();
         Call storage call = _getCall(callId);
