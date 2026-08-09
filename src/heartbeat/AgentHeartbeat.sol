@@ -30,6 +30,7 @@ contract AgentHeartbeat is IAgentHeartbeat, Initializable, UUPSUpgradeable, Owna
     uint256 public constant MIN_BALANCE = 0.1 ether;
     uint256 public constant MAX_CHECK_BATCH = 100;
     uint256 private constant MAX_TRACKED_AGENTS = 10_000;
+    uint256 public constant HEARTBEAT_FEE_WEI = 347_000_000_000_000;
 
     ITEEServiceRegistry public immutable TEE_REGISTRY;
     IAgentIdentityRegistry public immutable IDENTITY_REGISTRY;
@@ -133,7 +134,10 @@ contract AgentHeartbeat is IAgentHeartbeat, Initializable, UUPSUpgradeable, Owna
         emit SlotClaimed(agentId, msg.sender, executor, holderKey, identityOwner);
     }
 
-    function heartbeat(uint256 agentId, string calldata manifestCID, bytes calldata executorSignature) external {
+    function heartbeat(uint256 agentId, string calldata manifestCID, bytes calldata executorSignature)
+        external
+        payable
+    {
         require(bytes(manifestCID).length > 0, "manifest CID required");
 
         SlotAssignment storage slot = _assignments[agentId];
@@ -144,6 +148,7 @@ contract AgentHeartbeat is IAgentHeartbeat, Initializable, UUPSUpgradeable, Owna
         bytes32 digest = _slotHeartbeatDigest(agentId, manifestCID, nonce);
         address signer = digest.toEthSignedMessageHash().recover(executorSignature);
         require(signer == slot.boundExecutor, "executor mismatch");
+        require(msg.value == HEARTBEAT_FEE_WEI, "incorrect heartbeat fee");
 
         slotNonce[agentId] = nonce + 1;
         slot.lastHeartbeat = uint64(block.number);

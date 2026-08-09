@@ -75,7 +75,7 @@ interface IAgentHeartbeat {
         bytes calldata encryptedDAConfig
     ) external;
 
-    function heartbeat(uint256 agentId, string calldata manifestCID, bytes calldata executorSignature) external;
+    function heartbeat(uint256 agentId, string calldata manifestCID, bytes calldata executorSignature) external payable;
 
     function recall(uint256 agentId) external;
 
