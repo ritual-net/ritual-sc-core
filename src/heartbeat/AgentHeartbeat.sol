@@ -9,6 +9,7 @@ import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 import {IAgentHeartbeat} from "./interfaces/IAgentHeartbeat.sol";
 import {ITEEServiceRegistry} from "../async/ITEEServiceRegistry.sol";
+import {ITEECapabilityPolicy} from "../async/ITEECapabilityPolicy.sol";
 import {IAgentIdentityRegistry} from "../identity/IAgentIdentityRegistry.sol";
 
 /// @title AgentHeartbeat
@@ -122,7 +123,7 @@ contract AgentHeartbeat is IAgentHeartbeat, Initializable, UUPSUpgradeable, Owna
         bytes32 digest = _claimDigest(agentId, holderKey, executor, msg.sender, nonce);
         address signer = digest.toEthSignedMessageHash().recover(executorSignature);
         require(signer == executor, "signature not from claimed executor");
-        require(_isRegisteredExecutor(executor), "executor not registered");
+        require(_isRegisteredHttpExecutor(executor), "executor not registered");
 
         _clearPreviousAssignmentForClaim(agentId, slot, msg.sender);
 
@@ -162,6 +163,7 @@ contract AgentHeartbeat is IAgentHeartbeat, Initializable, UUPSUpgradeable, Owna
         address signer = digest.toEthSignedMessageHash().recover(executorSignature);
         require(signer == slot.boundExecutor, "executor mismatch");
         require(msg.value == HEARTBEAT_FEE_WEI, "incorrect heartbeat fee");
+        require(_isRegisteredHttpExecutor(slot.boundExecutor), "executor not registered");
 
         slotNonce[agentId] = nonce + 1;
         slot.lastHeartbeat = uint64(block.number);
@@ -560,9 +562,13 @@ contract AgentHeartbeat is IAgentHeartbeat, Initializable, UUPSUpgradeable, Owna
         }
     }
 
-    function _isRegisteredExecutor(address addr) internal view returns (bool) {
+    /// @dev Persistent-agent claim/heartbeat executors must carry HTTP_CALL, matching the
+    ///      PERSISTENT_AGENT_PRECOMPILE capability mapping in AsyncJobTracker.
+    function _isRegisteredHttpExecutor(address addr) internal view returns (bool) {
+        // getValidService reverts (caught below) unless the attestation is valid,
+        // so only the capability needs checking on the success path.
         try TEE_REGISTRY.getValidService(addr) returns (ITEEServiceRegistry.TEEServiceContext memory ctx) {
-            return ctx.isValid;
+            return ctx.node.capability == ITEECapabilityPolicy.Capability.HTTP_CALL;
         } catch {
             return false;
         }
