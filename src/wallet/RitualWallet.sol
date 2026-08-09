@@ -342,8 +342,6 @@ contract RitualWallet is IRitualWallet, Initializable, UUPSUpgradeable, OwnableU
         // Transfer actual ETH to the Scheduler contract
         (bool success,) = payable(msg.sender).call{value: actualFee}("");
         if (!success) {
-            // Restore balance if transfer fails
-            _balances[sponsor] += actualFee;
             revert TransferFailed();
         }
 
