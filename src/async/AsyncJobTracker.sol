@@ -29,7 +29,7 @@ contract AsyncJobTracker is Initializable, UUPSUpgradeable, OwnableUpgradeable {
     uint256 public constant CLEANUP_INTERVAL = 30;
     uint256 public constant MAX_CLEANUP_BUCKETS = 64;
 
-    /// @dev Maximum items to clean per cleanup call (gas bound: 25 × ~280K = 7M gas)
+    /// @dev Caps the number of jobs removed per cleanup call to bound gas usage.
     uint256 public constant MAX_CLEANUP_PER_CALL = 25;
 
     // REQUIREMENT: 10KB input limit (FHE with DA layer requires ~7KB for encrypted storage credentials)
@@ -202,7 +202,6 @@ contract AsyncJobTracker is Initializable, UUPSUpgradeable, OwnableUpgradeable {
     struct ReserveConfig {
         address sponsor;
         uint256 reserveAmount;
-        uint64 reserveExpiryBlock;
         bytes32[] expiredEscrows;
     }
 
@@ -275,16 +274,12 @@ contract AsyncJobTracker is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         _validateExecutor(job.exec, job.precomp);
 
         require(address(ritualWallet) != address(0), "wallet not set");
+        uint64 exp = uint64(block.number + job.ttl);
         ritualWallet.reserveFrom(
-            reserve.sponsor,
-            job.caller,
-            job.id,
-            reserve.reserveAmount,
-            reserve.reserveExpiryBlock,
-            reserve.expiredEscrows
+            reserve.sponsor, job.caller, job.id, reserve.reserveAmount, exp, reserve.expiredEscrows
         );
 
-        _storeReservedJob(job);
+        _storeReservedJob(job, exp);
     }
 
     function addScheduledJobAndReserve(
@@ -311,17 +306,13 @@ contract AsyncJobTracker is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         }
 
         require(address(ritualWallet) != address(0), "wallet not set");
+        uint64 exp = uint64(block.number + job.ttl);
         (bool ok, IRitualWallet.ReserveFailure reason) = ritualWallet.tryReserveFrom(
-            reserve.sponsor,
-            job.caller,
-            job.id,
-            reserve.reserveAmount,
-            reserve.reserveExpiryBlock,
-            reserve.expiredEscrows
+            reserve.sponsor, job.caller, job.id, reserve.reserveAmount, exp, reserve.expiredEscrows
         );
 
         if (ok) {
-            _storeReservedJob(job);
+            _storeReservedJob(job, exp);
             ISchedulerAsyncBridge(scheduler)
                 .markScheduledAsyncInFlight(schedule.callId, schedule.executionIndex, job.id);
             emit ScheduledAsyncCommitted(schedule.callId, schedule.executionIndex, job.id, reserve.sponsor, job.caller);
@@ -357,7 +348,7 @@ contract AsyncJobTracker is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         _validateDeliveryFees(job.input, job.precomp);
     }
 
-    function _storeReservedJob(AddJobInput calldata job) internal {
+    function _storeReservedJob(AddJobInput calldata job, uint64 exp) internal {
         uint256 createdAt = block.timestamp;
 
         Job storage j = jobs[job.id];
@@ -380,7 +371,6 @@ contract AsyncJobTracker is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         txRlpHashes[job.id] = keccak256(job.origRlp);
         txRlpSizes[job.id] = job.origRlp.length;
 
-        uint256 exp = block.number + job.ttl;
         expiryBuckets[exp].push(job.id);
         bucketIndex[job.id] = expiryBuckets[exp].length - 1;
         expiryBlock[job.id] = exp;
@@ -922,6 +912,12 @@ contract AsyncJobTracker is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         address exec = jobExecutor[id];
         if (exec == address(0)) {
             return false;
+        }
+
+        // Settlement and prior permissionless cleanup legitimately leave no escrow.
+        // Any escrow still present must be expired; strict expiry exposes deadline drift.
+        if (ritualWallet.escrows(id).sponsor != address(0)) {
+            ritualWallet.expire(id);
         }
 
         // Remove from expiry bucket (swap-and-pop)

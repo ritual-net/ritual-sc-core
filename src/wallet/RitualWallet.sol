@@ -16,6 +16,9 @@ import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/ut
 /// @dev Payment V2 is a fresh-deployment-only storage layout. It is not
 ///      backwards-compatible with prior RitualWallet proxy storage.
 contract RitualWallet is IRitualWallet, Initializable, UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuardUpgradeable {
+    /// @notice Maximum number of caller-supplied escrow cleanup hints accepted during reservation.
+    uint256 public constant MAX_EXPIRED_SWEEP = 8;
+
     /*//////////////////////////////////////////////////////////////
                               IMMUTABLE
     //////////////////////////////////////////////////////////////*/
@@ -44,6 +47,9 @@ contract RitualWallet is IRitualWallet, Initializable, UUPSUpgradeable, OwnableU
     mapping(address => mapping(address => uint256)) public allowance;
 
     /// @notice Per-job escrow state.
+    /// @dev Lifecycle is presence-based: an absent record is reusable; a present record is
+    ///      live through its expiry block and reclaimable after it. Expiry and final
+    ///      settlement both delete the record. Protocol nonce/bitmap state prevents replay.
     mapping(bytes32 => Escrow) private _escrows;
 
     /*//////////////////////////////////////////////////////////////
@@ -144,7 +150,7 @@ contract RitualWallet is IRitualWallet, Initializable, UUPSUpgradeable, OwnableU
     }
 
     function _withdraw(address account, uint256 amount, bytes32[] memory expiredEscrows) internal {
-        _sweepExpired(account, expiredEscrows);
+        _releaseOwned(account, expiredEscrows);
 
         if (_balances[account] < amount) {
             revert InsufficientBalance();
@@ -203,7 +209,19 @@ contract RitualWallet is IRitualWallet, Initializable, UUPSUpgradeable, OwnableU
         uint64 expiryBlock,
         bytes32[] calldata expiredEscrows
     ) external onlyAuthorized {
-        _reserveFrom(sponsor, caller, escrowId, amount, expiryBlock, expiredEscrows);
+        (bool ok, ReserveFailure reason) = _reserve(sponsor, caller, escrowId, amount, expiryBlock, expiredEscrows);
+        if (!ok) {
+            if (reason == ReserveFailure.ESCROW_ALREADY_EXISTS) {
+                revert EscrowAlreadyExists();
+            }
+            if (reason == ReserveFailure.INVALID_ESCROW_EXPIRY) {
+                revert InvalidEscrowExpiry();
+            }
+            if (reason == ReserveFailure.INSUFFICIENT_ALLOWANCE) {
+                revert InsufficientAllowance();
+            }
+            revert InsufficientBalance();
+        }
     }
 
     /// @inheritdoc IRitualWallet
@@ -215,51 +233,10 @@ contract RitualWallet is IRitualWallet, Initializable, UUPSUpgradeable, OwnableU
         uint64 expiryBlock,
         bytes32[] calldata expiredEscrows
     ) external onlyAuthorized returns (bool ok, ReserveFailure reason) {
-        return _tryReserveFrom(sponsor, caller, escrowId, amount, expiryBlock, expiredEscrows);
+        return _reserve(sponsor, caller, escrowId, amount, expiryBlock, expiredEscrows);
     }
 
-    function _reserveFrom(
-        address sponsor,
-        address caller,
-        bytes32 escrowId,
-        uint256 amount,
-        uint64 expiryBlock,
-        bytes32[] calldata expiredEscrows
-    ) internal {
-        _sweepExpired(sponsor, expiredEscrows);
-
-        if (_escrows[escrowId].status != EscrowStatus.NONE) {
-            revert EscrowAlreadyExists();
-        }
-        if (expiryBlock <= block.number) {
-            revert InvalidEscrowExpiry();
-        }
-
-        if (sponsor != caller) {
-            uint256 currentAllowance = allowance[sponsor][caller];
-            if (currentAllowance < amount) {
-                revert InsufficientAllowance();
-            }
-            if (currentAllowance != type(uint256).max) {
-                allowance[sponsor][caller] = currentAllowance - amount;
-            }
-        }
-
-        if (_balances[sponsor] < amount) {
-            revert InsufficientBalance();
-        }
-
-        _balances[sponsor] -= amount;
-        reservedBalance[sponsor] += amount;
-
-        _escrows[escrowId] = Escrow({
-            sponsor: sponsor, reserved: amount, paid: 0, expiryBlock: expiryBlock, status: EscrowStatus.ACTIVE
-        });
-
-        emit EscrowReserved(escrowId, sponsor, amount, expiryBlock);
-    }
-
-    function _tryReserveFrom(
+    function _reserve(
         address sponsor,
         address caller,
         bytes32 escrowId,
@@ -267,9 +244,24 @@ contract RitualWallet is IRitualWallet, Initializable, UUPSUpgradeable, OwnableU
         uint64 expiryBlock,
         bytes32[] calldata expiredEscrows
     ) internal returns (bool ok, ReserveFailure reason) {
-        _sweepExpired(sponsor, expiredEscrows);
+        // The target is handled independently so same-ID recommit never depends on hints.
+        _release(escrowId);
 
-        if (_escrows[escrowId].status != EscrowStatus.NONE) {
+        uint256 expiredEscrowsLength = expiredEscrows.length;
+        if (expiredEscrowsLength > MAX_EXPIRED_SWEEP) {
+            revert TooManyExpiredEscrows();
+        }
+        for (uint256 i; i < expiredEscrowsLength;) {
+            bytes32 expiredEscrowId = expiredEscrows[i];
+            if (_escrows[expiredEscrowId].sponsor == sponsor) {
+                _release(expiredEscrowId);
+            }
+            unchecked {
+                ++i;
+            }
+        }
+
+        if (_exists(escrowId)) {
             return (false, ReserveFailure.ESCROW_ALREADY_EXISTS);
         }
         if (expiryBlock <= block.number) {
@@ -298,9 +290,7 @@ contract RitualWallet is IRitualWallet, Initializable, UUPSUpgradeable, OwnableU
         _balances[sponsor] -= amount;
         reservedBalance[sponsor] += amount;
 
-        _escrows[escrowId] = Escrow({
-            sponsor: sponsor, reserved: amount, paid: 0, expiryBlock: expiryBlock, status: EscrowStatus.ACTIVE
-        });
+        _escrows[escrowId] = Escrow({sponsor: sponsor, reserved: amount, paid: 0, expiryBlock: expiryBlock});
 
         emit EscrowReserved(escrowId, sponsor, amount, expiryBlock);
         return (true, ReserveFailure.NONE);
@@ -317,14 +307,16 @@ contract RitualWallet is IRitualWallet, Initializable, UUPSUpgradeable, OwnableU
 
     /// @inheritdoc IRitualWallet
     function expire(bytes32 escrowId) external {
-        _expire(escrowId);
+        if (!_release(escrowId)) {
+            revert EscrowNotExpired();
+        }
     }
 
     /// @inheritdoc IRitualWallet
     function expireMany(bytes32[] calldata escrowIds) external {
         uint256 escrowIdsLength = escrowIds.length;
         for (uint256 i; i < escrowIdsLength;) {
-            _expire(escrowIds[i]);
+            _release(escrowIds[i]);
             unchecked {
                 ++i;
             }
@@ -407,7 +399,7 @@ contract RitualWallet is IRitualWallet, Initializable, UUPSUpgradeable, OwnableU
         internal
     {
         Escrow storage escrow = _escrows[escrowId];
-        if (escrow.status != EscrowStatus.ACTIVE) {
+        if (escrow.sponsor == address(0)) {
             revert EscrowNotActive();
         }
         if (block.number > escrow.expiryBlock) {
@@ -440,11 +432,10 @@ contract RitualWallet is IRitualWallet, Initializable, UUPSUpgradeable, OwnableU
         if (close) {
             closedRefund = escrow.reserved;
             if (closedRefund > 0) {
-                escrow.reserved = 0;
                 reservedBalance[sponsor] -= closedRefund;
                 _balances[sponsor] += closedRefund;
             }
-            escrow.status = EscrowStatus.SETTLED;
+            delete _escrows[escrowId];
         } else {
             if (newExpiry != 0) {
                 if (newExpiry <= block.number) {
@@ -469,32 +460,35 @@ contract RitualWallet is IRitualWallet, Initializable, UUPSUpgradeable, OwnableU
         emit EscrowSettled(escrowId, sponsor, totalPayments, refund + closedRefund, close);
     }
 
-    function _expire(bytes32 escrowId) internal {
-        Escrow storage escrow = _escrows[escrowId];
-        if (escrow.status != EscrowStatus.ACTIVE || block.number <= escrow.expiryBlock) {
-            return;
-        }
-
-        uint256 remaining = escrow.reserved;
-        escrow.reserved = 0;
-        escrow.status = EscrowStatus.EXPIRED;
-
-        if (remaining > 0) {
-            reservedBalance[escrow.sponsor] -= remaining;
-            _balances[escrow.sponsor] += remaining;
-        }
-
-        emit EscrowExpired(escrowId, escrow.sponsor, remaining);
+    function _exists(bytes32 escrowId) internal view returns (bool) {
+        return _escrows[escrowId].sponsor != address(0);
     }
 
-    function _sweepExpired(address sponsor, bytes32[] memory escrowIds) internal {
+    /// @dev Release an escrow only when present and strictly past its deadline.
+    function _release(bytes32 escrowId) internal returns (bool) {
+        Escrow storage escrow = _escrows[escrowId];
+        if (escrow.sponsor == address(0) || block.number <= escrow.expiryBlock) {
+            return false;
+        }
+
+        address sponsor = escrow.sponsor;
+        uint256 remaining = escrow.reserved;
+        if (remaining > 0) {
+            reservedBalance[sponsor] -= remaining;
+            _balances[sponsor] += remaining;
+        }
+
+        emit EscrowExpired(escrowId, sponsor, remaining);
+        delete _escrows[escrowId];
+        return true;
+    }
+
+    function _releaseOwned(address sponsor, bytes32[] memory escrowIds) internal {
         uint256 escrowIdsLength = escrowIds.length;
         for (uint256 i; i < escrowIdsLength;) {
             bytes32 escrowId = escrowIds[i];
-            Escrow storage escrow = _escrows[escrowId];
-            if (escrow.sponsor == sponsor && escrow.status == EscrowStatus.ACTIVE && block.number > escrow.expiryBlock)
-            {
-                _expire(escrowId);
+            if (_escrows[escrowId].sponsor == sponsor) {
+                _release(escrowId);
             }
             unchecked {
                 ++i;

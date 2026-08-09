@@ -8,13 +8,6 @@ pragma solidity ^0.8.28;
 /// @title IRitualWallet
 /// @notice Interface for ritual wallet escrow system
 interface IRitualWallet {
-    enum EscrowStatus {
-        NONE,
-        ACTIVE,
-        SETTLED,
-        EXPIRED
-    }
-
     enum ReserveFailure {
         NONE,
         INSUFFICIENT_BALANCE,
@@ -23,12 +16,14 @@ interface IRitualWallet {
         INVALID_ESCROW_EXPIRY
     }
 
+    /// @dev Lifecycle is derived from presence and `block.number`: absent is reusable,
+    ///      present through `expiryBlock` is live, and present after it is reclaimable.
+    ///      Expiry and final settlement delete the record.
     struct Escrow {
         address sponsor;
         uint256 reserved;
         uint256 paid;
         uint64 expiryBlock;
-        EscrowStatus status;
     }
 
     struct Payment {
@@ -92,6 +87,12 @@ interface IRitualWallet {
     /// @notice Thrown when escrow expiry is invalid.
     error InvalidEscrowExpiry();
 
+    /// @notice Thrown when an escrow is absent or has not passed its expiry block.
+    error EscrowNotExpired();
+
+    /// @notice Thrown when a reserve request supplies more than the bounded cleanup limit.
+    error TooManyExpiredEscrows();
+
     /// @notice Thrown when allowance is insufficient.
     error InsufficientAllowance();
 
@@ -139,10 +140,10 @@ interface IRitualWallet {
     /// @notice Decrease caller allowance.
     function decreaseAllowance(address caller, uint256 amount) external;
 
-    /// @notice Permissionlessly expire one escrow.
+    /// @notice Permissionlessly expire one escrow, reverting unless it is present and expired.
     function expire(bytes32 escrowId) external;
 
-    /// @notice Permissionlessly expire many escrows.
+    /// @notice Permissionlessly and best-effort expire many escrows.
     function expireMany(bytes32[] calldata escrowIds) external;
 
     /// @notice Reserve a sponsor-funded escrow for a caller-owned async job.
