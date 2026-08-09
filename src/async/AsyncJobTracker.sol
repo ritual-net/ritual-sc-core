@@ -289,7 +289,6 @@ contract AsyncJobTracker is Initializable, UUPSUpgradeable, OwnableUpgradeable {
     ) external onlyCommitmentCaller {
         require(scheduler != address(0), "scheduler not set");
         require(schedule.scheduledOriginHash != bytes32(0), "empty scheduled origin");
-        require(schedule.scheduledOriginHash == job.origHash, "scheduled origin mismatch");
         require(schedule.scheduledOriginHash == job.id, "scheduled job mismatch");
         require(job.txOrigin == address(0), "scheduled txOrigin set");
 
