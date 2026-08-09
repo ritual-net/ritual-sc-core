@@ -375,14 +375,14 @@ contract AsyncJobTracker is Initializable, UUPSUpgradeable, OwnableUpgradeable {
             return;
         }
 
+        // getValidService reverts unless the attestation is valid, so a successful
+        // return already guarantees context.isValid; only capability needs checking.
         ITEEServiceRegistry.TEEServiceContext memory context;
-        try TEE_SERVICE_REGISTRY.getService(executor) returns (ITEEServiceRegistry.TEEServiceContext memory result) {
+        try TEE_SERVICE_REGISTRY.getValidService(executor) returns (
+            ITEEServiceRegistry.TEEServiceContext memory result
+        ) {
             context = result;
         } catch {
-            revert InvalidExecutor(executor);
-        }
-
-        if (!context.isValid) {
             revert InvalidExecutor(executor);
         }
 
@@ -424,7 +424,7 @@ contract AsyncJobTracker is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         // the executor attestation and capability policy valid.
         // Ritual reth checks the executor is valid at job commitment, but we conservatively
         // do not allow settlement if the executor became invalid in the interim.
-        ITEEServiceRegistry.TEEServiceContext memory context = TEE_SERVICE_REGISTRY.getService(executorTeeAddress);
+        ITEEServiceRegistry.TEEServiceContext memory context = TEE_SERVICE_REGISTRY.getValidService(executorTeeAddress);
         executorPaymentAddress = context.node.paymentAddress;
         require(executorPaymentAddress != address(0), "executor payment not found");
     }

@@ -548,7 +548,7 @@ contract AgentHeartbeat is IAgentHeartbeat, Initializable, UUPSUpgradeable, Owna
     }
 
     function _isRegisteredExecutor(address addr) internal view returns (bool) {
-        try TEE_REGISTRY.getService(addr) returns (ITEEServiceRegistry.TEEServiceContext memory ctx) {
+        try TEE_REGISTRY.getValidService(addr) returns (ITEEServiceRegistry.TEEServiceContext memory ctx) {
             return ctx.isValid;
         } catch {
             return false;
