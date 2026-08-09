@@ -213,6 +213,9 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
     /// @notice Maximum number of explicit cleanup IDs assigned to one scheduled execution.
     uint256 public constant MAX_CLEANUP_BATCH = 25;
 
+    /// @notice Maximum opaque callback payload stored for one scheduled call.
+    uint256 public constant MAX_CALL_DATA_LENGTH = 12 * 1024;
+
     /// @notice Maximum number of executions per scheduled call.
     /// @dev The scheduler tracks consumed execution indices in one 256-bit bitmap. `MAX_LIFESPAN`
     ///      independently bounds total call residency; this cap keeps replay/completion accounting single-slot.
@@ -373,6 +376,9 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
 
     /// @notice Thrown when a schedule would remain resident longer than MAX_LIFESPAN
     error ScheduleLifespanExceeded();
+
+    /// @notice Thrown when a scheduled callback payload exceeds MAX_CALL_DATA_LENGTH
+    error CallDataTooLarge();
 
     /// @notice Thrown when an explicit cleanup batch has an invalid size
     error InvalidCleanupBatchSize();
@@ -699,8 +705,8 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
     /// @dev This is the core scheduling logic used by all public schedule() overloads.
     ///      `data` is an opaque payload: on each execution the Scheduler delivers it verbatim via
     ///      `IScheduledCallback.onScheduledExecution(executionIndex, data)` on the target. The Scheduler
-    ///      never inspects or mutates `data`, so it may be any length (including empty) and the caller does
-    ///      not encode the execution index into it — the index is delivered as an explicit argument.
+    ///      never inspects or mutates `data`; it may be empty but cannot exceed MAX_CALL_DATA_LENGTH. The
+    ///      caller does not encode the execution index into it — the index is delivered separately.
     function _schedule(
         bytes memory data,
         uint32 gas,
@@ -733,6 +739,10 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         // Validate TTL against maximum allowed value
         if (ttl > MAX_TTL) {
             revert InvalidTTL();
+        }
+
+        if (data.length > MAX_CALL_DATA_LENGTH) {
+            revert CallDataTooLarge();
         }
 
         // Reject start blocks in the past

@@ -31,6 +31,11 @@ contract AgentHeartbeat is IAgentHeartbeat, Initializable, UUPSUpgradeable, Owna
     uint256 public constant MAX_CHECK_BATCH = 100;
     uint256 private constant MAX_TRACKED_AGENTS = 10_000;
     uint256 public constant HEARTBEAT_FEE_WEI = 347_000_000_000_000;
+    uint256 public constant MAX_ENCRYPTED_DA_CONFIG_LENGTH = 10 * 1024;
+    uint256 public constant MAX_MANIFEST_CID_LENGTH = 256;
+
+    error EncryptedDAConfigTooLarge();
+    error ManifestCIDTooLarge();
 
     ITEEServiceRegistry public immutable TEE_REGISTRY;
     IAgentIdentityRegistry public immutable IDENTITY_REGISTRY;
@@ -100,6 +105,10 @@ contract AgentHeartbeat is IAgentHeartbeat, Initializable, UUPSUpgradeable, Owna
     ) external {
         require(msg.sender.balance >= MIN_BALANCE, "insufficient balance");
 
+        if (encryptedDAConfig.length > MAX_ENCRYPTED_DA_CONFIG_LENGTH) {
+            revert EncryptedDAConfigTooLarge();
+        }
+
         address identityOwner = IDENTITY_REGISTRY.ownerOf(agentId);
 
         SlotAssignment storage slot = _assignments[agentId];
@@ -138,7 +147,11 @@ contract AgentHeartbeat is IAgentHeartbeat, Initializable, UUPSUpgradeable, Owna
         external
         payable
     {
-        require(bytes(manifestCID).length > 0, "manifest CID required");
+        uint256 manifestCIDLength = bytes(manifestCID).length;
+        require(manifestCIDLength > 0, "manifest CID required");
+        if (manifestCIDLength > MAX_MANIFEST_CID_LENGTH) {
+            revert ManifestCIDTooLarge();
+        }
 
         SlotAssignment storage slot = _assignments[agentId];
         require(slot.state == SlotState.ACTIVE, "slot not active");
