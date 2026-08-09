@@ -1395,6 +1395,8 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
                 gasUsed,
                 "Execution reverted"
             );
+
+            _payProposerTip(priorityFee, gasUsed, feesPaid);
             return; // User pays for gas consumed, but value is refunded
         }
 
@@ -1423,6 +1425,30 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
             gasUsed,
             feesPaid
         );
+
+        _payProposerTip(priorityFee, gasUsed, feesPaid);
+    }
+
+    /// @dev Pay the block proposer the priority-fee tip for the gas a scheduled call actually
+    ///      consumed, funded from the fees already collected from the sponsor and held by this
+    ///      contract. Scheduled transactions are excluded from the execution layer's default
+    ///      EIP-1559 beneficiary reward (see ritual-revm `reward_beneficiary`), so all proposer
+    ///      payment for them is performed here. The payout is capped at `feesPaid` so a scheduled
+    ///      call can never pay the proposer more than the sponsor actually paid — it can never
+    ///      mint. `priorityFee * gasUsed` is the same tip the default reward would have paid, but
+    ///      metered on the target call's gas rather than the whole system transaction.
+    function _payProposerTip(uint256 priorityFee, uint256 gasUsed, uint256 feesPaid) private {
+        uint256 tip = priorityFee * gasUsed;
+        if (tip > feesPaid) {
+            tip = feesPaid;
+        }
+        if (tip != 0) {
+            (bool ok,) = block.coinbase.call{value: tip}("");
+            if (!ok) {
+                // An unpayable proposer simply forgoes the tip; the scheduled transaction must
+                // remain valid regardless, so the un-tipped funds stay in the contract.
+            }
+        }
     }
 
     /// @dev Validates and records AsyncJobTracker admission without consuming the Scheduler bitmap.
