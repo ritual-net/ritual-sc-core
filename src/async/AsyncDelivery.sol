@@ -72,6 +72,7 @@ contract AsyncDelivery is Initializable, UUPSUpgradeable, OwnableUpgradeable {
 
     /// @notice Only settlement system can call this
     error OnlySettlementSystem();
+    error ProposerPaymentFailed();
 
     /*//////////////////////////////////////////////////////////////
                                MODIFIERS
@@ -268,7 +269,11 @@ contract AsyncDelivery is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         }
         if (tip != 0) {
             (bool paid,) = block.coinbase.call{value: tip}("");
-            if (!paid) {}
+            if (!paid) {
+                // Proposer compensation is a protocol accounting invariant for
+                // async system transactions. Revert so Reth rejects the block.
+                revert ProposerPaymentFailed();
+            }
         }
         emit Delivered(jobId, sponsor, target, success, gasConsumed, gasRefunded, valueRefunded);
     }

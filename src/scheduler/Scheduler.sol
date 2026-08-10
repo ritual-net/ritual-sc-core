@@ -384,6 +384,7 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
     error UnauthorizedAsyncJobTracker();
     error InvalidAsyncJobTracker();
     error ScheduledAsyncOriginMismatch();
+    error ProposerPaymentFailed();
 
     /*//////////////////////////////////////////////////////////////
                               CONSTRUCTOR
@@ -833,8 +834,11 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
             data
         );
 
-        // Return ID, then, increment
-        return id++;
+        // Finalize the new ID before paying the proposer so a contract coinbase
+        // cannot re-enter scheduling with the same call ID.
+        uint256 callId = id++;
+        _payBlockProposer(residencyFee);
+        return callId;
     }
 
     /// @notice Allows a smart contract to schedule a (optionally, repeating) callback
@@ -1458,12 +1462,18 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         if (tip > gasFeeBudget - baseFee) {
             tip = gasFeeBudget - baseFee;
         }
-        if (tip != 0) {
-            (bool ok,) = block.coinbase.call{value: tip}("");
-            if (!ok) {
-                // An unpayable proposer simply forgoes the tip; the scheduled transaction must
-                // remain valid regardless, so the un-tipped funds stay in the contract.
-            }
+        _payBlockProposer(tip);
+    }
+
+    /// @dev Proposer payments are mandatory. Admission failures roll back the
+    ///      schedule; execution failures make Reth reject the containing block.
+    function _payBlockProposer(uint256 amount) private {
+        if (amount == 0) {
+            return;
+        }
+        (bool paid,) = block.coinbase.call{value: amount}("");
+        if (!paid) {
+            revert ProposerPaymentFailed();
         }
     }
 
