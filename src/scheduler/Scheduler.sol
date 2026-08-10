@@ -155,14 +155,15 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
     );
 
     /// @notice Emitted when a call completes all executions
+    /// @dev Terminal marker only. Consumed indices always equal `numCalls` here, and TTL-skipped
+    ///      indices count toward completion; count `CallExecuted` events for actual executions.
     event CallCompleted(
         uint256 indexed callId,
         address indexed to,
         address indexed sponsor,
         uint32 startBlock,
         uint32 numCalls,
-        uint32 frequency,
-        uint256 totalExecutions
+        uint32 frequency
     );
 
     /// @notice Emitted when a call expires
@@ -616,7 +617,7 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         // Mark as completed and clean up
         call.state = CallState.COMPLETED;
         emit CallStateChanged(callId, call.to, previousState, CallState.COMPLETED);
-        emit CallCompleted(callId, call.to, call.sponsor, call.startBlock, call.numCalls, call.frequency, call.numCalls);
+        emit CallCompleted(callId, call.to, call.sponsor, call.startBlock, call.numCalls, call.frequency);
 
         // Free the slot back to the available pool
         uint256 slotIndex = callToSlot[callId];
