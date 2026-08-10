@@ -547,8 +547,10 @@ contract AgentHeartbeat is IAgentHeartbeat, Initializable, UUPSUpgradeable, Owna
     /// @dev Persistent-agent claim/heartbeat executors must carry HTTP_CALL, matching the
     ///      PERSISTENT_AGENT_PRECOMPILE capability mapping in AsyncJobTracker.
     function _isRegisteredHttpExecutor(address addr) internal view returns (bool) {
+        // getService reverts (caught below) unless the attestation is valid,
+        // so only the capability needs checking on the success path.
         try TEE_REGISTRY.getService(addr) returns (ITEEServiceRegistry.TEEServiceContext memory ctx) {
-            return ctx.isValid && ctx.node.capability == ITEECapabilityPolicy.Capability.HTTP_CALL;
+            return ctx.node.capability == ITEECapabilityPolicy.Capability.HTTP_CALL;
         } catch {
             return false;
         }

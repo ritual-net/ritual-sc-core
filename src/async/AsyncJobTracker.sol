@@ -417,14 +417,12 @@ contract AsyncJobTracker is Initializable, UUPSUpgradeable, OwnableUpgradeable {
             return;
         }
 
+        // getService reverts unless the attestation is valid, so a successful
+        // return already guarantees context.isValid; only capability needs checking.
         ITEEServiceRegistry.TEEServiceContext memory context;
         try TEE_SERVICE_REGISTRY.getService(executor) returns (ITEEServiceRegistry.TEEServiceContext memory result) {
             context = result;
         } catch {
-            revert InvalidExecutor(executor);
-        }
-
-        if (!context.isValid) {
             revert InvalidExecutor(executor);
         }
 
@@ -442,10 +440,6 @@ contract AsyncJobTracker is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         try TEE_SERVICE_REGISTRY.getService(executor) returns (ITEEServiceRegistry.TEEServiceContext memory result) {
             context = result;
         } catch {
-            return SCHEDULED_INVALID_EXECUTOR_REASON;
-        }
-
-        if (!context.isValid) {
             return SCHEDULED_INVALID_EXECUTOR_REASON;
         }
 
