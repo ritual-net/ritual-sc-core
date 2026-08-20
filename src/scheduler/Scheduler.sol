@@ -398,7 +398,6 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
     error UnauthorizedAsyncJobTracker();
     error InvalidAsyncJobTracker();
     error ScheduledAsyncOriginMismatch();
-    error ProposerPaymentFailed();
 
     /*//////////////////////////////////////////////////////////////
                               CONSTRUCTOR
@@ -854,10 +853,13 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
             data
         );
 
-        // Finalize the new ID before paying the proposer so a contract coinbase
-        // cannot re-enter scheduling with the same call ID.
+        // Pay the proposer their residency fee via the wallet's pull-model credit rather than a
+        // direct push to block.coinbase. schedule() is a user transaction, so a contract coinbase
+        // that reverts or burns gas on receipt could otherwise grief every caller at their expense
+        // (and farm their gas). Crediting the wallet runs no proposer-controlled code; the proposer
+        // withdraws later. This mirrors how AsyncDelivery pays block.coinbase through the wallet.
         uint256 callId = id++;
-        _payBlockProposer(residencyFee);
+        RITUAL_WALLET.creditProposer{value: residencyFee}(block.coinbase, callId);
         return callId;
     }
 
@@ -1459,7 +1461,7 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
                 "Execution reverted"
             );
 
-            _distributeGasFees(priorityFee, gasUsed, effectiveFeePerGas * callSnapshot.gas);
+            _distributeGasFees(callId, priorityFee, gasUsed, effectiveFeePerGas * callSnapshot.gas);
             return; // User pays for gas consumed, but value is refunded
         }
 
@@ -1489,7 +1491,7 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
             feesPaid
         );
 
-        _distributeGasFees(priorityFee, gasUsed, effectiveFeePerGas * callSnapshot.gas);
+        _distributeGasFees(callId, priorityFee, gasUsed, effectiveFeePerGas * callSnapshot.gas);
     }
 
     /// @dev Pay the burn address the base fee and the block proposer the priority-fee tip for gas
@@ -1500,7 +1502,10 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
     ///      call can never pay out more than the sponsor-funded callback gas budget — it can never
     ///      mint. `priorityFee * gasUsed` is the same tip the default reward would have paid, but
     ///      metered on the target call's gas rather than the whole system transaction.
-    function _distributeGasFees(uint256 priorityFee, uint256 gasUsed, uint256 gasFeeBudget) private {
+    ///      The tip is credited to the proposer's wallet balance (pull model) rather than pushed
+    ///      to `block.coinbase`, so no proposer-controlled code runs and every proposer payout in
+    ///      the protocol goes through the same wallet mechanism.
+    function _distributeGasFees(uint256 callId, uint256 priorityFee, uint256 gasUsed, uint256 gasFeeBudget) private {
         uint256 baseFee = block.basefee * gasUsed;
         if (baseFee > gasFeeBudget) {
             baseFee = gasFeeBudget;
@@ -1510,18 +1515,8 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         if (tip > gasFeeBudget - baseFee) {
             tip = gasFeeBudget - baseFee;
         }
-        _payBlockProposer(tip);
-    }
-
-    /// @dev Proposer payments are mandatory. Admission failures roll back the
-    ///      schedule; execution failures make Reth reject the containing block.
-    function _payBlockProposer(uint256 amount) private {
-        if (amount == 0) {
-            return;
-        }
-        (bool paid,) = block.coinbase.call{value: amount}("");
-        if (!paid) {
-            revert ProposerPaymentFailed();
+        if (tip != 0) {
+            RITUAL_WALLET.creditProposer{value: tip}(block.coinbase, callId);
         }
     }
 

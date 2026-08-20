@@ -364,6 +364,16 @@ contract RitualWallet is IRitualWallet, Initializable, UUPSUpgradeable, OwnableU
         emit GasRefund(sponsor, refundAmount, callId);
     }
 
+    /// @inheritdoc IRitualWallet
+    function creditProposer(address proposer, uint256 callId) external payable onlySchedulerOrAsyncDelivery {
+        if (msg.value == 0) {
+            return;
+        }
+
+        _balances[proposer] += msg.value;
+        emit ProposerPayment(proposer, msg.value, callId);
+    }
+
     function _settle(bytes32 escrowId, Payment[] memory payments, uint256 refund, uint64 newExpiry, bool close)
         internal
     {

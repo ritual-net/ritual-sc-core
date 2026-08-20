@@ -72,7 +72,6 @@ contract AsyncDelivery is Initializable, UUPSUpgradeable, OwnableUpgradeable {
 
     /// @notice Only settlement system can call this
     error OnlySettlementSystem();
-    error ProposerPaymentFailed();
 
     /*//////////////////////////////////////////////////////////////
                                MODIFIERS
@@ -268,12 +267,10 @@ contract AsyncDelivery is Initializable, UUPSUpgradeable, OwnableUpgradeable {
             tip = callbackGasBudget - baseFee;
         }
         if (tip != 0) {
-            (bool paid,) = block.coinbase.call{value: tip}("");
-            if (!paid) {
-                // Proposer compensation is a protocol accounting invariant for
-                // async system transactions. Revert so Reth rejects the block.
-                revert ProposerPaymentFailed();
-            }
+            // Pull-model proposer payout: credit the tip to the proposer's wallet balance rather
+            // than pushing to block.coinbase, so no proposer-controlled code runs here and all
+            // proposer payments (schedule residency, settle inclusion fee, tips) use one mechanism.
+            RITUAL_WALLET.creditProposer{value: tip}(block.coinbase, uint256(jobId));
         }
         emit Delivered(jobId, sponsor, target, success, gasConsumed, gasRefunded, valueRefunded);
     }

@@ -37,7 +37,15 @@ interface IRitualWallet {
     event FeeDeduction(address indexed sponsor, uint256 amount, uint256 callId);
 
     /// @notice Emitted when unused execution gas is refunded to the operation sponsor.
+    /// @dev `callId` is caller-scoped: the Scheduler passes its sequential call ID, while
+    ///      AsyncDelivery passes `uint256(jobId)` (the async transaction hash).
     event GasRefund(address indexed sponsor, uint256 amount, uint256 callId);
+
+    /// @notice Emitted when a block proposer is credited a protocol fee (pull-model payout).
+    /// @dev `callId` is caller-scoped: the Scheduler passes its sequential call ID (residency fee
+    ///      at schedule time, tip at execute time), while AsyncDelivery passes `uint256(jobId)`
+    ///      (the async transaction hash) for delivery tips.
+    event ProposerPayment(address indexed proposer, uint256 amount, uint256 callId);
 
     /// @notice Emitted when a sponsor-to-caller allowance is explicitly updated.
     event AllowanceUpdated(address indexed sponsor, address indexed caller, uint256 amount);
@@ -167,6 +175,17 @@ interface IRitualWallet {
     /// @notice Refund unused execution gas to an operation sponsor (scheduler/delivery only)
     /// @param sponsor Sponsor address receiving the refund
     /// @param refundAmount Amount to refund in wei
-    /// @param callId Associated call ID for tracking
+    /// @param callId Caller-scoped correlation ID: sequential scheduler call ID, or `uint256(jobId)`
+    ///        when called by AsyncDelivery
     function refundGas(address sponsor, uint256 refundAmount, uint256 callId) external payable;
+
+    /// @notice Credit a block proposer's withdrawable balance with a protocol fee (scheduler/delivery only).
+    /// @dev Pull-model payout: the fee accrues to the proposer's wallet balance and is claimed via
+    ///      `withdraw`, rather than being pushed to `block.coinbase` by a raw call. This prevents a
+    ///      contract coinbase from reverting or burning gas on the paying (user) transaction. The
+    ///      credited amount must be funded by the ETH sent with the call, mirroring `refundGas`.
+    /// @param proposer Proposer address (typically `block.coinbase`) to credit.
+    /// @param callId Caller-scoped correlation ID: sequential scheduler call ID, or `uint256(jobId)`
+    ///        when called by AsyncDelivery.
+    function creditProposer(address proposer, uint256 callId) external payable;
 }
