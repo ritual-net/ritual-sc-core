@@ -21,6 +21,16 @@ enum CallState {
     EXPIRED
 }
 
+/// @notice Recoverable predicate outcomes that skip one execution attempt without consuming its index.
+/// @dev The call remains scheduled until the index executes or its TTL path consumes/expires it.
+///      Appending a reason is a coordinated consensus change because node software validates this enum.
+enum PredicateSkipReason {
+    /// @notice The predicate returned a well-formed `false` value.
+    PredicateFalse,
+    /// @notice The predicate reverted, exhausted its gas cap, returned fewer than 32 bytes, or returned a non-boolean word.
+    PredicateCheckFailed
+}
+
 /// @notice A `Call` is a scheduled contract call with EIP-1559 pricing
 /// @dev Tightly-packed struct for gas optimization
 struct Call {
@@ -109,6 +119,9 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         uint256 gasUsed,
         string reason
     );
+
+    /// @notice Emitted when the live predicate prevents an otherwise-due execution.
+    event CallExecutionSkipped(uint256 indexed callId, uint256 indexed executionIndex, PredicateSkipReason reason);
 
     /// @notice Emitted when a call is cancelled with complete metadata
     event CallCancelled(
@@ -218,6 +231,9 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
     /// @dev The scheduler tracks consumed execution indices in one 256-bit bitmap. `MAX_LIFESPAN`
     ///      independently bounds total call residency; this cap keeps replay/completion accounting single-slot.
     uint32 private constant MAX_NUM_CALLS = 256;
+
+    /// @notice Maximum gas forwarded to the contract-side predicate backstop.
+    uint256 private constant MAX_PREDICATE_GAS = 100_000;
 
     /// @notice Maximum total lifespan of a scheduled call in blocks
     /// @dev Bounds slot residency so long-lived calls cannot accumulate for years.
@@ -354,12 +370,6 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
     /// @notice Thrown when predicate contract is invalid (doesn't implement IScheduledPredicate)
     /// @dev 4-byte signature: TBD
     error InvalidPredicate();
-
-    /// @notice Thrown when a scheduled execution predicate returns false
-    error PredicateReturnedFalse(uint256 callId, uint256 executionIndex, address predicate);
-
-    /// @notice Thrown when a scheduled execution predicate reverts or cannot be evaluated
-    error PredicateCheckFailed(uint256 callId, uint256 executionIndex, address predicate);
 
     /// @notice Thrown when maxFeePerGas or maxPriorityFeePerGas exceeds uint128 range
     /// @dev EIP-1559 fee fields are u128 in the execution layer; values above u128::MAX
@@ -1319,14 +1329,33 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
 
         address predicate = callPredicates[callId];
         if (predicate != address(0)) {
-            (bool predicateOk, bytes memory predicateResult) = predicate.staticcall(
-                abi.encodeCall(IScheduledPredicate.shouldExecute, (callSnapshot.to, callId, executionIndex))
-            );
-            if (!predicateOk || predicateResult.length < 32) {
-                revert PredicateCheckFailed(callId, executionIndex, predicate);
+            bytes memory predicateCalldata =
+                abi.encodeCall(IScheduledPredicate.shouldExecute, (callSnapshot.to, callId, executionIndex));
+            bool predicateOk;
+            uint256 predicateResultSize;
+            uint256 predicateValue;
+            uint256 predicateGasLimit = MAX_PREDICATE_GAS;
+            assembly ("memory-safe") {
+                predicateOk := staticcall(
+                    predicateGasLimit,
+                    predicate,
+                    add(predicateCalldata, 0x20),
+                    mload(predicateCalldata),
+                    0,
+                    0x20
+                )
+                predicateResultSize := returndatasize()
+                predicateValue := mload(0)
             }
-            if (!abi.decode(predicateResult, (bool))) {
-                revert PredicateReturnedFalse(callId, executionIndex, predicate);
+            if (!predicateOk || predicateResultSize < 32 || predicateValue != 1) {
+                PredicateSkipReason reason = predicateOk && predicateResultSize >= 32 && predicateValue == 0
+                    ? PredicateSkipReason.PredicateFalse
+                    : PredicateSkipReason.PredicateCheckFailed;
+                // Builder and verifier pre-filter predicates against parent state. This uncharged
+                // contract path is only the backstop for a predicate changing later in the block;
+                // it must not replace that pre-filter. The index remains pending for a later attempt.
+                emit CallExecutionSkipped(callId, executionIndex, reason);
+                return;
             }
         }
 
