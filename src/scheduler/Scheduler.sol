@@ -341,6 +341,10 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
     /// @dev 4-byte signature: `0xe3c2448f`
     error InvalidFrequency();
 
+    /// @notice Thrown when the callback gas limit is zero
+    /// @dev 4-byte signature: `0x98bdb2e0`
+    error InvalidGasLimit();
+
     /// @notice Thrown when TTL exceeds the maximum allowed value
     /// @dev 4-byte signature: `0x31d2f2b7`
     error InvalidTTL();
@@ -734,6 +738,12 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         // Add frequency validation - frequency must be >= 1
         if (frequency == 0) {
             revert InvalidFrequency();
+        }
+
+        // A zero callback budget can never execute the target; reject it at admission rather
+        // than admit a schedule that only ever burns slot residency and proposer bookkeeping.
+        if (gas == 0) {
+            revert InvalidGasLimit();
         }
 
         // Validate numCalls - must be in [1, MAX_NUM_CALLS] to keep consumed-index accounting
