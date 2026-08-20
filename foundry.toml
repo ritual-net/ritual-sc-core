@@ -1,0 +1,16 @@
+[profile.default]
+src = "src"
+test = "test"
+out = "out"
+libs = ["lib"]
+solc_version = "0.8.28"
+optimizer_runs = 1_000_000
+via_ir = true
+remappings = [
+  "forge-std/=lib/forge-std/src/",
+  "flashtestations/=lib/flashtestations/src/",
+  "automata-dcap-attestation/=lib/flashtestations/lib/automata-dcap-attestation/evm/",
+  "solady/=lib/solady/src/",
+  "@openzeppelin/contracts-upgradeable/=lib/openzeppelin-contracts-upgradeable/contracts/",
+  "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+]
