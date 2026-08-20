@@ -787,6 +787,7 @@ contract AsyncJobTracker is Initializable, UUPSUpgradeable, OwnableUpgradeable {
             maxPriorityFee := calldataload(add(input.offset, maxPriorityFeeOffset))
         }
 
+        require(gasLimit > 0, "delivery gasLimit is zero");
         require(gasLimit <= type(uint64).max, "delivery gasLimit exceeds u64");
         require(maxFee <= type(uint128).max, "maxFeePerGas exceeds u128");
         require(maxPriorityFee <= type(uint128).max, "maxPriorityFeePerGas exceeds u128");
