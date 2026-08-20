@@ -1418,6 +1418,15 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         (bool success,) = callSnapshot.to.call{gas: callSnapshot.gas, value: callSnapshot.value}(callbackData);
         uint256 gasUsed = startGas - gasleft();
 
+        // The measured window also contains the CALL opcode envelope (cold access, value surcharge,
+        // stipend), which is not part of the sponsor's callback budget. Clamp so `gasUsed <= gas`
+        // holds for the fee math, the emitted events (which Reth uses as this system tx's block gas
+        // contribution) and the burn/tip split below — otherwise a reverted callback that carried
+        // value would be under-refunded by the envelope and that amount stranded here.
+        if (gasUsed > callSnapshot.gas) {
+            gasUsed = callSnapshot.gas;
+        }
+
         // The scheduled target may have re-entered Scheduler and moved this call
         // by cancelling another slot. Reload by callId before any post-call state
         // transition and discard pre-call storage references.
