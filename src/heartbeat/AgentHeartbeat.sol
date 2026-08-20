@@ -534,6 +534,11 @@ contract AgentHeartbeat is IAgentHeartbeat, Initializable, UUPSUpgradeable, Owna
         revivalAttempts[agentId] += 1;
 
         address executor = _extractExecutorFromInput(precompileInput);
+        // Same registry gate as claim()/heartbeat(), applied before binding. Reth already
+        // derives the revival executor from registered HTTP_CALL services and verifies that
+        // choice in consensus (VC-REV-02), so an honest builder never reaches this revert;
+        // a reverted reviveAgent system transaction makes the containing block invalid.
+        require(_isRegisteredHttpExecutor(executor), "executor not registered");
         bytes memory precompilePayload = precompileInput;
         _applyRevivalPrecompileCall(agentId, slot, executor, precompilePayload);
     }
