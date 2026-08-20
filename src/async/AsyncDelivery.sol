@@ -72,6 +72,7 @@ contract AsyncDelivery is Initializable, UUPSUpgradeable, OwnableUpgradeable {
 
     /// @notice Only settlement system can call this
     error OnlySettlementSystem();
+    error BaseFeeBurnFailed();
 
     /*//////////////////////////////////////////////////////////////
                                MODIFIERS
@@ -261,7 +262,7 @@ contract AsyncDelivery is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         if (baseFee > callbackGasBudget) {
             baseFee = callbackGasBudget;
         }
-        payable(BURN_ADDRESS).transfer(baseFee);
+        _burnBaseFee(baseFee);
         uint256 tip = (effectiveFeePerGas - block.basefee) * gasConsumed;
         if (tip > callbackGasBudget - baseFee) {
             tip = callbackGasBudget - baseFee;
@@ -273,6 +274,19 @@ contract AsyncDelivery is Initializable, UUPSUpgradeable, OwnableUpgradeable {
             RITUAL_WALLET.creditProposer{value: tip}(block.coinbase, uint256(jobId));
         }
         emit Delivered(jobId, sponsor, target, success, gasConsumed, gasRefunded, valueRefunded);
+    }
+
+    /// @dev Burn the base-fee portion of consumed callback gas. `BURN_ADDRESS` is codeless, so a
+    ///      failed transfer is a protocol accounting invariant violation and must revert so Reth
+    ///      rejects the block.
+    function _burnBaseFee(uint256 amount) private {
+        if (amount == 0) {
+            return;
+        }
+        (bool burned,) = BURN_ADDRESS.call{value: amount}("");
+        if (!burned) {
+            revert BaseFeeBurnFailed();
+        }
     }
 
     /*//////////////////////////////////////////////////////////////

@@ -398,6 +398,7 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
     error UnauthorizedAsyncJobTracker();
     error InvalidAsyncJobTracker();
     error ScheduledAsyncOriginMismatch();
+    error BaseFeeBurnFailed();
 
     /*//////////////////////////////////////////////////////////////
                               CONSTRUCTOR
@@ -1510,13 +1511,26 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         if (baseFee > gasFeeBudget) {
             baseFee = gasFeeBudget;
         }
-        payable(BURN_ADDRESS).transfer(baseFee);
+        _burnBaseFee(baseFee);
         uint256 tip = priorityFee * gasUsed;
         if (tip > gasFeeBudget - baseFee) {
             tip = gasFeeBudget - baseFee;
         }
         if (tip != 0) {
             RITUAL_WALLET.creditProposer{value: tip}(block.coinbase, callId);
+        }
+    }
+
+    /// @dev Burn the base-fee portion of consumed callback gas. `BURN_ADDRESS` is codeless, so a
+    ///      failed transfer is a protocol accounting invariant violation and must revert so Reth
+    ///      rejects the block.
+    function _burnBaseFee(uint256 amount) private {
+        if (amount == 0) {
+            return;
+        }
+        (bool burned,) = BURN_ADDRESS.call{value: amount}("");
+        if (!burned) {
+            revert BaseFeeBurnFailed();
         }
     }
 
