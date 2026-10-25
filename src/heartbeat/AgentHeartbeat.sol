@@ -9,7 +9,9 @@ import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 import {IAgentHeartbeat} from "./interfaces/IAgentHeartbeat.sol";
 import {ITEEServiceRegistry} from "../async/ITEEServiceRegistry.sol";
+import {ITEECapabilityPolicy} from "../async/ITEECapabilityPolicy.sol";
 import {IAgentIdentityRegistry} from "../identity/IAgentIdentityRegistry.sol";
+import {IRitualWallet} from "../wallet/IRitualWallet.sol";
 
 /// @title AgentHeartbeat
 /// @notice System contract for monitoring persistent-agent liveness and agentId-keyed revival.
@@ -30,9 +32,16 @@ contract AgentHeartbeat is IAgentHeartbeat, Initializable, UUPSUpgradeable, Owna
     uint256 public constant MIN_BALANCE = 0.1 ether;
     uint256 public constant MAX_CHECK_BATCH = 100;
     uint256 private constant MAX_TRACKED_AGENTS = 10_000;
+    uint256 public constant HEARTBEAT_FEE_WEI = 347_000_000_000_000;
+    uint256 public constant MAX_ENCRYPTED_DA_CONFIG_LENGTH = 10 * 1024;
+    uint256 public constant MAX_MANIFEST_CID_LENGTH = 256;
+
+    error EncryptedDAConfigTooLarge();
+    error ManifestCIDTooLarge();
 
     ITEEServiceRegistry public immutable TEE_REGISTRY;
     IAgentIdentityRegistry public immutable IDENTITY_REGISTRY;
+    IRitualWallet public immutable RITUAL_WALLET;
     uint64 public immutable MAX_REVIVAL_ATTEMPTS;
 
     uint64 public defaultTimeout;
@@ -47,11 +56,12 @@ contract AgentHeartbeat is IAgentHeartbeat, Initializable, UUPSUpgradeable, Owna
     mapping(uint256 => uint64) public revivalAttempts;
 
     /// @custom:oz-upgrades-unsafe-allow constructor
-    constructor(address teeRegistry, address identityRegistry, uint64 maxRevivalAttempts) {
+    constructor(address teeRegistry, address identityRegistry, address ritualWallet, uint64 maxRevivalAttempts) {
         require(maxRevivalAttempts > 0, "max revival attempts zero");
         _disableInitializers();
         TEE_REGISTRY = ITEEServiceRegistry(teeRegistry);
         IDENTITY_REGISTRY = IAgentIdentityRegistry(identityRegistry);
+        RITUAL_WALLET = IRitualWallet(ritualWallet);
         MAX_REVIVAL_ATTEMPTS = maxRevivalAttempts;
     }
 
@@ -99,6 +109,10 @@ contract AgentHeartbeat is IAgentHeartbeat, Initializable, UUPSUpgradeable, Owna
     ) external {
         require(msg.sender.balance >= MIN_BALANCE, "insufficient balance");
 
+        if (encryptedDAConfig.length > MAX_ENCRYPTED_DA_CONFIG_LENGTH) {
+            revert EncryptedDAConfigTooLarge();
+        }
+
         address identityOwner = IDENTITY_REGISTRY.ownerOf(agentId);
 
         SlotAssignment storage slot = _assignments[agentId];
@@ -112,7 +126,7 @@ contract AgentHeartbeat is IAgentHeartbeat, Initializable, UUPSUpgradeable, Owna
         bytes32 digest = _claimDigest(agentId, holderKey, executor, msg.sender, nonce);
         address signer = digest.toEthSignedMessageHash().recover(executorSignature);
         require(signer == executor, "signature not from claimed executor");
-        require(_isRegisteredExecutor(executor), "executor not registered");
+        require(_isRegisteredHttpExecutor(executor), "executor not registered");
 
         _clearPreviousAssignmentForClaim(agentId, slot, msg.sender);
 
@@ -133,8 +147,15 @@ contract AgentHeartbeat is IAgentHeartbeat, Initializable, UUPSUpgradeable, Owna
         emit SlotClaimed(agentId, msg.sender, executor, holderKey, identityOwner);
     }
 
-    function heartbeat(uint256 agentId, string calldata manifestCID, bytes calldata executorSignature) external {
-        require(bytes(manifestCID).length > 0, "manifest CID required");
+    function heartbeat(uint256 agentId, string calldata manifestCID, bytes calldata executorSignature)
+        external
+        payable
+    {
+        uint256 manifestCIDLength = bytes(manifestCID).length;
+        require(manifestCIDLength > 0, "manifest CID required");
+        if (manifestCIDLength > MAX_MANIFEST_CID_LENGTH) {
+            revert ManifestCIDTooLarge();
+        }
 
         SlotAssignment storage slot = _assignments[agentId];
         require(slot.state == SlotState.ACTIVE, "slot not active");
@@ -144,12 +165,19 @@ contract AgentHeartbeat is IAgentHeartbeat, Initializable, UUPSUpgradeable, Owna
         bytes32 digest = _slotHeartbeatDigest(agentId, manifestCID, nonce);
         address signer = digest.toEthSignedMessageHash().recover(executorSignature);
         require(signer == slot.boundExecutor, "executor mismatch");
+        require(msg.value == HEARTBEAT_FEE_WEI, "incorrect heartbeat fee");
+        address executorPaymentAddress = _registeredHttpExecutorPaymentAddress(slot.boundExecutor);
+        require(executorPaymentAddress != address(0), "executor not registered");
 
         slotNonce[agentId] = nonce + 1;
         slot.lastHeartbeat = uint64(block.number);
         slot.latestManifestCID = manifestCID;
         slot.revivalStatus = RevivalStatus.NONE;
         slot.cooldownEnd = 0;
+
+        // Credit the executor's configured payment address in RitualWallet. The
+        // executor can withdraw independently, matching async settlement's pull model.
+        RITUAL_WALLET.depositFor{value: msg.value}(executorPaymentAddress);
 
         emit SlotHeartbeat(agentId, msg.sender, uint64(block.number), manifestCID);
     }
@@ -506,6 +534,11 @@ contract AgentHeartbeat is IAgentHeartbeat, Initializable, UUPSUpgradeable, Owna
         revivalAttempts[agentId] += 1;
 
         address executor = _extractExecutorFromInput(precompileInput);
+        // Same registry gate as claim()/heartbeat(), applied before binding. Reth already
+        // derives the revival executor from registered HTTP_CALL services and verifies that
+        // choice in consensus (VC-REV-02), so an honest builder never reaches this revert;
+        // a reverted reviveAgent system transaction makes the containing block invalid.
+        require(_isRegisteredHttpExecutor(executor), "executor not registered");
         bytes memory precompilePayload = precompileInput;
         _applyRevivalPrecompileCall(agentId, slot, executor, precompilePayload);
     }
@@ -542,12 +575,19 @@ contract AgentHeartbeat is IAgentHeartbeat, Initializable, UUPSUpgradeable, Owna
         }
     }
 
-    function _isRegisteredExecutor(address addr) internal view returns (bool) {
-        try TEE_REGISTRY.getService(addr) returns (ITEEServiceRegistry.TEEServiceContext memory ctx) {
-            return ctx.isValid;
-        } catch {
-            return false;
-        }
+    /// @dev Persistent-agent claim/heartbeat executors must carry HTTP_CALL, matching the
+    ///      PERSISTENT_AGENT_PRECOMPILE capability mapping in AsyncJobTracker.
+    function _isRegisteredHttpExecutor(address addr) internal view returns (bool) {
+        return _registeredHttpExecutorPaymentAddress(addr) != address(0);
+    }
+
+    function _registeredHttpExecutorPaymentAddress(address addr) internal view returns (address) {
+        try TEE_REGISTRY.getValidService(addr) returns (ITEEServiceRegistry.TEEServiceContext memory ctx) {
+            if (ctx.node.capability == ITEECapabilityPolicy.Capability.HTTP_CALL) {
+                return ctx.node.paymentAddress;
+            }
+        } catch {}
+        return address(0);
     }
 
     function _claimDigest(uint256 agentId, bytes32 holderKey, address executor, address agent, uint256 nonce)

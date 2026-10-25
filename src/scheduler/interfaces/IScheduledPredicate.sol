@@ -10,9 +10,9 @@ interface IScheduledPredicate {
     /// @notice Determines if the scheduled call should be included in the current block
     /// @dev Called via staticcall by the block proposer. Must not modify state.
     ///      The predicate can access block.number directly via the EVM opcode.
-    /// @param caller The address that scheduled the call (stored in Call.caller)
+    /// @param target The scheduled callback target (stored in Call.to)
     /// @param callId The unique identifier for this scheduled call
     /// @param executionIndex The current execution index (0-based, increments each execution)
     /// @return True if the call should be included in this block, false to skip
-    function shouldExecute(address caller, uint256 callId, uint256 executionIndex) external view returns (bool);
+    function shouldExecute(address target, uint256 callId, uint256 executionIndex) external view returns (bool);
 }

@@ -8,27 +8,14 @@ pragma solidity ^0.8.28;
 /// @title IRitualWallet
 /// @notice Interface for ritual wallet escrow system
 interface IRitualWallet {
-    enum EscrowStatus {
-        NONE,
-        ACTIVE,
-        SETTLED,
-        EXPIRED
-    }
-
-    enum ReserveFailure {
-        NONE,
-        INSUFFICIENT_BALANCE,
-        INSUFFICIENT_ALLOWANCE,
-        ESCROW_ALREADY_EXISTS,
-        INVALID_ESCROW_EXPIRY
-    }
-
+    /// @dev Lifecycle is derived from presence and `block.number`: absent is reusable,
+    ///      present through `expiryBlock` is live, and present after it is reclaimable.
+    ///      Expiry and final settlement delete the record.
     struct Escrow {
         address sponsor;
         uint256 reserved;
         uint256 paid;
         uint64 expiryBlock;
-        EscrowStatus status;
     }
 
     struct Payment {
@@ -50,7 +37,15 @@ interface IRitualWallet {
     event FeeDeduction(address indexed sponsor, uint256 amount, uint256 callId);
 
     /// @notice Emitted when unused execution gas is refunded to the operation sponsor.
+    /// @dev `callId` is caller-scoped: the Scheduler passes its sequential call ID, while
+    ///      AsyncDelivery passes `uint256(jobId)` (the async transaction hash).
     event GasRefund(address indexed sponsor, uint256 amount, uint256 callId);
+
+    /// @notice Emitted when a block proposer is credited a protocol fee (pull-model payout).
+    /// @dev `callId` is caller-scoped: the Scheduler passes its sequential call ID (residency fee
+    ///      at schedule time, tip at execute time), while AsyncDelivery passes `uint256(jobId)`
+    ///      (the async transaction hash) for delivery tips.
+    event ProposerPayment(address indexed proposer, uint256 amount, uint256 callId);
 
     /// @notice Emitted when a sponsor-to-caller allowance is explicitly updated.
     event AllowanceUpdated(address indexed sponsor, address indexed caller, uint256 amount);
@@ -91,6 +86,12 @@ interface IRitualWallet {
 
     /// @notice Thrown when escrow expiry is invalid.
     error InvalidEscrowExpiry();
+
+    /// @notice Thrown when an escrow is absent or has not passed its expiry block.
+    error EscrowNotExpired();
+
+    /// @notice Thrown when a reserve request supplies more than the bounded cleanup limit.
+    error TooManyExpiredEscrows();
 
     /// @notice Thrown when allowance is insufficient.
     error InsufficientAllowance();
@@ -139,10 +140,10 @@ interface IRitualWallet {
     /// @notice Decrease caller allowance.
     function decreaseAllowance(address caller, uint256 amount) external;
 
-    /// @notice Permissionlessly expire one escrow.
+    /// @notice Permissionlessly expire one escrow, reverting unless it is present and expired.
     function expire(bytes32 escrowId) external;
 
-    /// @notice Permissionlessly expire many escrows.
+    /// @notice Permissionlessly and best-effort expire many escrows.
     function expireMany(bytes32[] calldata escrowIds) external;
 
     /// @notice Reserve a sponsor-funded escrow for a caller-owned async job.
@@ -154,17 +155,6 @@ interface IRitualWallet {
         uint64 expiryBlock,
         bytes32[] calldata expiredEscrows
     ) external;
-
-    /// @notice Non-reverting reserve path for scheduled async commitments.
-    /// @dev Economic/setup failures are returned; authorization failures still revert.
-    function tryReserveFrom(
-        address sponsor,
-        address caller,
-        bytes32 escrowId,
-        uint256 amount,
-        uint64 expiryBlock,
-        bytes32[] calldata expiredEscrows
-    ) external returns (bool ok, ReserveFailure reason);
 
     /// @notice Settle an active escrow. If `close` is false and `newExpiry` is zero, the existing expiry is kept.
     /// @dev Restricted in the implementation to authorized protocol contracts: Scheduler, AsyncDelivery, and AsyncJobTracker.
@@ -185,6 +175,17 @@ interface IRitualWallet {
     /// @notice Refund unused execution gas to an operation sponsor (scheduler/delivery only)
     /// @param sponsor Sponsor address receiving the refund
     /// @param refundAmount Amount to refund in wei
-    /// @param callId Associated call ID for tracking
+    /// @param callId Caller-scoped correlation ID: sequential scheduler call ID, or `uint256(jobId)`
+    ///        when called by AsyncDelivery
     function refundGas(address sponsor, uint256 refundAmount, uint256 callId) external payable;
+
+    /// @notice Credit a block proposer's withdrawable balance with a protocol fee (scheduler/delivery only).
+    /// @dev Pull-model payout: the fee accrues to the proposer's wallet balance and is claimed via
+    ///      `withdraw`, rather than being pushed to `block.coinbase` by a raw call. This prevents a
+    ///      contract coinbase from reverting or burning gas on the paying (user) transaction. The
+    ///      credited amount must be funded by the ETH sent with the call, mirroring `refundGas`.
+    /// @param proposer Proposer address (typically `block.coinbase`) to credit.
+    /// @param callId Caller-scoped correlation ID: sequential scheduler call ID, or `uint256(jobId)`
+    ///        when called by AsyncDelivery.
+    function creditProposer(address proposer, uint256 callId) external payable;
 }

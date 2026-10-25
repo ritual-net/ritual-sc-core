@@ -21,6 +21,16 @@ enum CallState {
     EXPIRED
 }
 
+/// @notice Recoverable predicate outcomes that skip one execution attempt without consuming its index.
+/// @dev The call remains scheduled until the index executes or its TTL path consumes/expires it.
+///      Appending a reason is a coordinated consensus change because node software validates this enum.
+enum PredicateSkipReason {
+    /// @notice The predicate returned a well-formed `false` value.
+    PredicateFalse,
+    /// @notice The predicate reverted, exhausted its gas cap, returned fewer than 32 bytes, or returned a non-boolean word.
+    PredicateCheckFailed
+}
+
 /// @notice A `Call` is a scheduled contract call with EIP-1559 pricing
 /// @dev Tightly-packed struct for gas optimization
 struct Call {
@@ -110,6 +120,9 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         string reason
     );
 
+    /// @notice Emitted when the live predicate prevents an otherwise-due execution.
+    event CallExecutionSkipped(uint256 indexed callId, uint256 indexed executionIndex, PredicateSkipReason reason);
+
     /// @notice Emitted when a call is cancelled with complete metadata
     event CallCancelled(
         uint256 indexed callId,
@@ -125,9 +138,6 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
     /// @param operator The owner account that triggered force-cancel
     /// @param previousState The call state before force-cancel cleanup
     event CallForceCancelled(uint256 indexed callId, address indexed operator, CallState previousState);
-
-    /// @notice Emitted when the owner updates the fixed scheduled execution fee.
-    event ScheduledExecutionFeeUpdated(uint256 oldFee, uint256 newFee);
 
     /// @notice Emitted when a call is skipped due to insufficient funds
     event CallSkippedInsufficientFunds(
@@ -158,14 +168,15 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
     );
 
     /// @notice Emitted when a call completes all executions
+    /// @dev Terminal marker only. Consumed indices always equal `numCalls` here, and TTL-skipped
+    ///      indices count toward completion; count `CallExecuted` events for actual executions.
     event CallCompleted(
         uint256 indexed callId,
         address indexed to,
         address indexed sponsor,
         uint32 startBlock,
         uint32 numCalls,
-        uint32 frequency,
-        uint256 totalExecutions
+        uint32 frequency
     );
 
     /// @notice Emitted when a call expires
@@ -210,25 +221,25 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
     /// @notice TX_HASH precompile address — returns the hash of the currently executing transaction
     address private constant TX_HASH_PRECOMPILE = 0x0000000000000000000000000000000000000830;
 
-    /// @notice Threshold for triggering automatic cleanup (number of slots)
-    /// @dev If slots.length exceeds this threshold, cleanup is triggered during execution
-    uint256 private constant CLEANUP_THRESHOLD = 1000;
+    /// @notice Maximum number of explicit cleanup IDs assigned to one scheduled execution.
+    uint256 public constant MAX_CLEANUP_BATCH = 25;
 
-    /// @dev Maximum items to clean per cleanup call (gas bound: 25 × ~280K = 7M gas)
-    uint256 private constant MAX_CLEANUP_PER_EXECUTE = 25;
+    /// @notice Maximum opaque callback payload stored for one scheduled call.
+    uint256 public constant MAX_CALL_DATA_LENGTH = 12 * 1024;
 
     /// @notice Maximum number of executions per scheduled call.
     /// @dev The scheduler tracks consumed execution indices in one 256-bit bitmap. `MAX_LIFESPAN`
     ///      independently bounds total call residency; this cap keeps replay/completion accounting single-slot.
     uint32 private constant MAX_NUM_CALLS = 256;
 
+    /// @notice Maximum gas forwarded to the contract-side predicate backstop.
+    uint256 private constant MAX_PREDICATE_GAS = 100_000;
+
     /// @notice Maximum total lifespan of a scheduled call in blocks
     /// @dev Bounds slot residency so long-lived calls cannot accumulate for years.
     uint256 public constant MAX_LIFESPAN = 10_000;
 
-    /// @notice Default non-refundable scheduler fee charged for each scheduled execution.
-    /// @dev Flat 0.01 RITUAL fee per scheduled invocation.
-    uint256 public constant DEFAULT_SCHEDULED_EXECUTION_FEE = 10_000_000_000_000_000;
+    address private constant BURN_ADDRESS = 0x000000000000000000000000000000000000dEaD;
 
     /// @notice Minimum maxFeePerGas accepted for newly scheduled calls.
     /// @dev Public Ritual chain base fee has held at 7 wei; this rejects zero-fee griefing without
@@ -264,11 +275,11 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
     ///      Enables the block builder to reconstruct TxScheduled without event processing.
     mapping(uint256 => bytes32) public originHash;
 
-    /// @notice AsyncJobTracker authorized to consume scheduled async obligations.
+    /// @notice AsyncJobTracker authorized to mark successful scheduled async admission.
     address public asyncJobTracker;
 
-    /// @notice Terminal reserve-failure markers for scheduled-origin async commitments.
-    mapping(bytes32 => bytes32) public scheduledAsyncReserveFailures;
+    /// @notice Replay-proven terminal cleanup reasons for scheduled async obligations.
+    mapping(bytes32 => bytes32) public scheduledAsyncCleanupReasons;
 
     /*//////////////////////////////////////////////////////////////
                           PREDICATE CONSTANTS
@@ -330,6 +341,10 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
     /// @dev 4-byte signature: `0xe3c2448f`
     error InvalidFrequency();
 
+    /// @notice Thrown when the callback gas limit is zero
+    /// @dev 4-byte signature: `0x98bdb2e0`
+    error InvalidGasLimit();
+
     /// @notice Thrown when TTL exceeds the maximum allowed value
     /// @dev 4-byte signature: `0x31d2f2b7`
     error InvalidTTL();
@@ -360,12 +375,6 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
     /// @dev 4-byte signature: TBD
     error InvalidPredicate();
 
-    /// @notice Thrown when a scheduled execution predicate returns false
-    error PredicateReturnedFalse(uint256 callId, uint256 executionIndex, address predicate);
-
-    /// @notice Thrown when a scheduled execution predicate reverts or cannot be evaluated
-    error PredicateCheckFailed(uint256 callId, uint256 executionIndex, address predicate);
-
     /// @notice Thrown when maxFeePerGas or maxPriorityFeePerGas exceeds uint128 range
     /// @dev EIP-1559 fee fields are u128 in the execution layer; values above u128::MAX
     ///      would cause overflow in downstream fee arithmetic.
@@ -377,12 +386,19 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
     /// @notice Thrown when a schedule would remain resident longer than MAX_LIFESPAN
     error ScheduleLifespanExceeded();
 
+    /// @notice Thrown when a scheduled callback payload exceeds MAX_CALL_DATA_LENGTH
+    error CallDataTooLarge();
+
+    /// @notice Thrown when an explicit cleanup batch has an invalid size
+    error InvalidCleanupBatchSize();
+
     /// @notice Thrown when maxFeePerGas is below the network floor for scheduled calls
     error MaxFeePerGasBelowFloor();
 
     error UnauthorizedAsyncJobTracker();
     error InvalidAsyncJobTracker();
     error ScheduledAsyncOriginMismatch();
+    error BaseFeeBurnFailed();
 
     /*//////////////////////////////////////////////////////////////
                               CONSTRUCTOR
@@ -404,26 +420,14 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
     function initialize(address _owner) external initializer {
         __Ownable_init(_owner);
         __UUPSUpgradeable_init();
-        _scheduledExecutionFee = DEFAULT_SCHEDULED_EXECUTION_FEE;
-        _scheduledExecutionFeeSet = true;
+        SCHEDULED_RESIDENCY_FEE_PER_BLOCK = 10_000_000_000_000_000;
     }
 
     /// @notice Restricts upgrades to owner only
     function _authorizeUpgrade(address) internal override onlyOwner {}
 
-    /// @notice Current non-refundable fee charged for each scheduled execution.
-    /// @dev Returns the default for already-initialized proxy deployments that predate this storage field.
-    function SCHEDULED_EXECUTION_FEE() public view returns (uint256) {
-        return _scheduledExecutionFeeSet ? _scheduledExecutionFee : DEFAULT_SCHEDULED_EXECUTION_FEE;
-    }
-
-    /// @notice Owner-only setter for the per-execution scheduled transaction fee.
-    /// @dev Allows setting the fee to zero; `_scheduledExecutionFeeSet` disambiguates zero from uninitialized.
-    function setScheduledExecutionFee(uint256 newFee) external onlyOwner {
-        uint256 oldFee = SCHEDULED_EXECUTION_FEE();
-        _scheduledExecutionFee = newFee;
-        _scheduledExecutionFeeSet = true;
-        emit ScheduledExecutionFeeUpdated(oldFee, newFee);
+    function setScheduledResidencyFeePerBlock(uint256 newFee) external onlyOwner {
+        SCHEDULED_RESIDENCY_FEE_PER_BLOCK = newFee;
     }
 
     function setAsyncJobTracker(address _asyncJobTracker) external onlyOwner {
@@ -604,28 +608,40 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         bool shouldComplete = _allExecutionIndicesConsumed(callId, call.numCalls);
 
         if (shouldComplete) {
-            _clearBitmap(callId);
-
-            // Mark as completed and clean up
-            call.state = CallState.COMPLETED;
-            emit CallStateChanged(callId, call.to, CallState.EXECUTING, CallState.COMPLETED);
-            emit CallCompleted(
-                callId, call.to, call.sponsor, call.startBlock, call.numCalls, call.frequency, call.numCalls
-            );
-
-            // Free the slot back to the available pool
-            uint256 slotIndex = callToSlot[callId];
-            _freeSlot(slotIndex);
-
-            // Remove the call ID mapping and auxiliary storage
-            delete callToSlot[callId];
-            delete originHash[callId];
-            delete callPredicates[callId];
+            _completeCall(callId, call, CallState.EXECUTING);
         } else {
             // Return to scheduled state for next execution
             call.state = CallState.SCHEDULED;
             emit CallStateChanged(callId, call.to, CallState.EXECUTING, CallState.SCHEDULED);
         }
+    }
+
+    /// @notice Terminal COMPLETED transition: tear down a call whose every execution index
+    ///         has been consumed.
+    /// @dev Shared by the post-execution path (previousState EXECUTING) and the TTL-skip
+    ///      path (previousState SCHEDULED), so both consumers of the last index perform the
+    ///      identical teardown. `call` is a storage pointer into the compactable `slots`
+    ///      array and `_freeSlot` moves slots; the caller must not touch `call` after this
+    ///      returns.
+    /// @param callId The call ID
+    /// @param call The call data
+    /// @param previousState The state the call held immediately before completion
+    function _completeCall(uint256 callId, Call storage call, CallState previousState) internal {
+        _clearBitmap(callId);
+
+        // Mark as completed and clean up
+        call.state = CallState.COMPLETED;
+        emit CallStateChanged(callId, call.to, previousState, CallState.COMPLETED);
+        emit CallCompleted(callId, call.to, call.sponsor, call.startBlock, call.numCalls, call.frequency);
+
+        // Free the slot back to the available pool
+        uint256 slotIndex = callToSlot[callId];
+        _freeSlot(slotIndex);
+
+        // Remove the call ID mapping and auxiliary storage
+        delete callToSlot[callId];
+        delete originHash[callId];
+        delete callPredicates[callId];
     }
 
     function _snapshotCall(Call storage call) internal view returns (CallExecutionSnapshot memory snap) {
@@ -667,16 +683,6 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         }
     }
 
-    function _consumeScheduledAsyncIndex(uint256 callId, Call storage call, uint256 executionIndex, bytes32 jobId)
-        internal
-    {
-        _validateScheduledAsyncPending(callId, call, executionIndex, jobId);
-        call.state = CallState.EXECUTING;
-        emit CallStateChanged(callId, call.to, CallState.SCHEDULED, CallState.EXECUTING);
-        _markExecuted(callId, executionIndex);
-        _handlePostExecution(callId, call, executionIndex, true);
-    }
-
     function _scheduledAsyncJobId(uint256 callId, uint256 executionIndex) internal view returns (bytes32) {
         bytes32 origin = originHash[callId];
         if (origin == bytes32(0)) {
@@ -709,8 +715,8 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
     /// @dev This is the core scheduling logic used by all public schedule() overloads.
     ///      `data` is an opaque payload: on each execution the Scheduler delivers it verbatim via
     ///      `IScheduledCallback.onScheduledExecution(executionIndex, data)` on the target. The Scheduler
-    ///      never inspects or mutates `data`, so it may be any length (including empty) and the caller does
-    ///      not encode the execution index into it — the index is delivered as an explicit argument.
+    ///      never inspects or mutates `data`; it may be empty but cannot exceed MAX_CALL_DATA_LENGTH. The
+    ///      caller does not encode the execution index into it — the index is delivered separately.
     function _schedule(
         bytes memory data,
         uint32 gas,
@@ -734,6 +740,12 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
             revert InvalidFrequency();
         }
 
+        // A zero callback budget can never execute the target; reject it at admission rather
+        // than admit a schedule that only ever burns slot residency and proposer bookkeeping.
+        if (gas == 0) {
+            revert InvalidGasLimit();
+        }
+
         // Validate numCalls - must be in [1, MAX_NUM_CALLS] to keep consumed-index accounting
         // inside the single executedBitmap word.
         if (numCalls == 0 || numCalls > MAX_NUM_CALLS) {
@@ -743,6 +755,10 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         // Validate TTL against maximum allowed value
         if (ttl > MAX_TTL) {
             revert InvalidTTL();
+        }
+
+        if (data.length > MAX_CALL_DATA_LENGTH) {
+            revert CallDataTooLarge();
         }
 
         // Reject start blocks in the past
@@ -772,12 +788,15 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
             revert MaxFeePerGasBelowFloor();
         }
 
-        // Scheduled calls are intentionally funded just-in-time: creation only
-        // proves the first execution can be paid, and every later execution
-        // re-checks/consumes balance and allowance. A missed payment evicts the
-        // remaining schedule instead of requiring lifetime escrow up front.
-        uint256 executionFee = SCHEDULED_EXECUTION_FEE();
-        uint256 maxExecutionCost = (maxFeePerGas * gas) + value + executionFee;
+        // Charge slot residency up front, then prove one execution remains affordable.
+        uint256 maxExecutionCost = (maxFeePerGas * gas) + value;
+        uint256 residencyFee = SCHEDULED_RESIDENCY_FEE_PER_BLOCK * (expiryBlock - block.number);
+        if (
+            RITUAL_WALLET.deductScheduledExecutionFeesFrom(sponsor, msg.sender, 0, 0, 0, residencyFee, id)
+                != residencyFee
+        ) {
+            revert InsufficientWalletFunds();
+        }
         if (sponsor != msg.sender && RITUAL_WALLET.allowance(sponsor, msg.sender) < maxExecutionCost) {
             revert UnauthorizedSponsor();
         }
@@ -786,8 +805,6 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         if (RITUAL_WALLET.availableBalance(sponsor) < maxExecutionCost) {
             revert InsufficientWalletFunds();
         }
-
-        // No upfront payment required - wallet-based system
 
         // Allocate a slot at the end of dynamic storage
         uint256 slotIndex = _allocateSlot();
@@ -837,8 +854,14 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
             data
         );
 
-        // Return ID, then, increment
-        return id++;
+        // Pay the proposer their residency fee via the wallet's pull-model credit rather than a
+        // direct push to block.coinbase. schedule() is a user transaction, so a contract coinbase
+        // that reverts or burns gas on receipt could otherwise grief every caller at their expense
+        // (and farm their gas). Crediting the wallet runs no proposer-controlled code; the proposer
+        // withdraws later. This mirrors how AsyncDelivery pays block.coinbase through the wallet.
+        uint256 callId = id++;
+        RITUAL_WALLET.creditProposer{value: residencyFee}(block.coinbase, callId);
+        return callId;
     }
 
     /// @notice Allows a smart contract to schedule a (optionally, repeating) callback
@@ -1149,6 +1172,13 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
     {
         address to = call.to;
         address sponsor = call.sponsor;
+        _cancelScheduledCall(callId, call);
+        emit CallEvictedInsufficientFunds(callId, to, sponsor, requiredAmount, availableAmount);
+    }
+
+    function _cancelScheduledCall(uint256 callId, Call storage call) internal {
+        address to = call.to;
+        address sponsor = call.sponsor;
         uint32 startBlock = call.startBlock;
         uint32 numCalls = call.numCalls;
         uint32 frequency = call.frequency;
@@ -1157,7 +1187,6 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         call.state = CallState.CANCELLED;
         emit CallStateChanged(callId, to, oldState, CallState.CANCELLED);
         emit CallCancelled(callId, to, sponsor, startBlock, numCalls, frequency);
-        emit CallEvictedInsufficientFunds(callId, to, sponsor, requiredAmount, availableAmount);
 
         _clearBitmap(callId);
 
@@ -1179,17 +1208,33 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
     ///      variable times. Reth owns canonical scheduled transaction body matching and duplicate/window
     ///      validity, but does not require index `n - 1` to complete before index `n`.
     function execute(uint256 callId, uint256 executionIndex) external payable {
-        // Restrict to only system account
+        _execute(callId, executionIndex);
+    }
+
+    /// @notice Executes a call after reclaiming a bounded batch of explicitly selected expired slots.
+    /// @param callId `Call` to execute
+    /// @param executionIndex Which execution this is (0-based for recurring calls)
+    /// @param cleanupCallIds Explicit call IDs to check for expiry before executing `callId`
+    /// @dev An empty batch is valid. Cleanup completes before `_execute` resolves `callId`,
+    ///      because dense slot compaction may move the target call.
+    function execute(uint256 callId, uint256 executionIndex, uint256[] calldata cleanupCallIds) external payable {
+        if (cleanupCallIds.length > MAX_CLEANUP_BATCH) {
+            revert InvalidCleanupBatchSize();
+        }
+        // The target must remain available for `_execute`, which owns its normal
+        // expiry and execution semantics.
+        _cleanupExpiredCallsByIds(cleanupCallIds, callId, true);
+        _execute(callId, executionIndex);
+    }
+
+    function _execute(uint256 callId, uint256 executionIndex) internal {
+        // Any cleanup above rolls back atomically if the caller is unauthorized.
         if (msg.sender != SYSTEM_ACCOUNT) {
             revert SenderNotSystemAccount();
         }
 
-        // Check if cleanup threshold is exceeded and trigger cleanup if needed
-        if (slots.length > CLEANUP_THRESHOLD) {
-            _cleanupExpiredCallsScan();
-        }
-
-        // Get the scheduled call from circular buffer
+        // Resolve only the requested call. Scheduled execution must never scan
+        // unrelated slots.
         Call storage call = _getCall(callId);
         // Snapshot fields used after target-controlled execution. The storage
         // reference may be stale after reentrant Scheduler calls move slots.
@@ -1268,14 +1313,24 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
             emit CallSkippedTTLExpired(
                 callId, callSnapshot.to, callSnapshot.sponsor, expectedBlock, block.number, callSnapshot.ttl
             );
+
+            // Indices may be consumed out of order, so this skip can fill the LAST outstanding
+            // bit. Run the same completion transition the execution path performs; otherwise the
+            // call would sit SCHEDULED with a full bitmap forever, every index rejecting as
+            // AlreadyExecuted, never reaching a terminal state (Zellic 3.8). Nothing was
+            // executed and no fee was charged: this branch returns before any fee arithmetic,
+            // so completion here records zero gas and zero payment for the skipped index.
+            // No statement may follow: _completeCall frees the slot, invalidating `call`.
+            if (_allExecutionIndicesConsumed(callId, callSnapshot.numCalls)) {
+                _completeCall(callId, call, CallState.SCHEDULED);
+            }
             return;
         }
 
         // Calculate proper EIP-1559 effective fee for deduction
         uint256 baseFee = block.basefee;
-        uint256 executionFee = SCHEDULED_EXECUTION_FEE();
         if (baseFee > callSnapshot.maxFeePerGas) {
-            uint256 requiredAmount = (baseFee * callSnapshot.gas) + callSnapshot.value + executionFee;
+            uint256 requiredAmount = (baseFee * callSnapshot.gas) + callSnapshot.value;
             uint256 availableAmount = RITUAL_WALLET.availableBalance(callSnapshot.sponsor);
             emit CallSkippedInsufficientFunds(
                 callId, callSnapshot.to, callSnapshot.sponsor, requiredAmount, availableAmount
@@ -1287,14 +1342,33 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
 
         address predicate = callPredicates[callId];
         if (predicate != address(0)) {
-            (bool predicateOk, bytes memory predicateResult) = predicate.staticcall(
-                abi.encodeCall(IScheduledPredicate.shouldExecute, (callSnapshot.to, callId, executionIndex))
-            );
-            if (!predicateOk || predicateResult.length < 32) {
-                revert PredicateCheckFailed(callId, executionIndex, predicate);
+            bytes memory predicateCalldata =
+                abi.encodeCall(IScheduledPredicate.shouldExecute, (callSnapshot.to, callId, executionIndex));
+            bool predicateOk;
+            uint256 predicateResultSize;
+            uint256 predicateValue;
+            uint256 predicateGasLimit = MAX_PREDICATE_GAS;
+            assembly ("memory-safe") {
+                predicateOk := staticcall(
+                    predicateGasLimit,
+                    predicate,
+                    add(predicateCalldata, 0x20),
+                    mload(predicateCalldata),
+                    0,
+                    0x20
+                )
+                predicateResultSize := returndatasize()
+                predicateValue := mload(0)
             }
-            if (!abi.decode(predicateResult, (bool))) {
-                revert PredicateReturnedFalse(callId, executionIndex, predicate);
+            if (!predicateOk || predicateResultSize < 32 || predicateValue != 1) {
+                PredicateSkipReason reason = predicateOk && predicateResultSize >= 32 && predicateValue == 0
+                    ? PredicateSkipReason.PredicateFalse
+                    : PredicateSkipReason.PredicateCheckFailed;
+                // Builder and verifier pre-filter predicates against parent state. This uncharged
+                // contract path is only the backstop for a predicate changing later in the block;
+                // it must not replace that pre-filter. The index remains pending for a later attempt.
+                emit CallExecutionSkipped(callId, executionIndex, reason);
+                return;
             }
         }
 
@@ -1313,13 +1387,7 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
 
         // Deduct execution fees from sponsor's account in system wallet.
         uint256 feesPaid = RITUAL_WALLET.deductScheduledExecutionFeesFrom(
-            callSnapshot.sponsor,
-            callSnapshot.to,
-            effectiveFeePerGas,
-            callSnapshot.gas,
-            callSnapshot.value,
-            executionFee,
-            callId
+            callSnapshot.sponsor, callSnapshot.to, effectiveFeePerGas, callSnapshot.gas, callSnapshot.value, 0, callId
         );
 
         // If wallet deduction failed (insufficient funds), emit event and skip execution
@@ -1328,7 +1396,7 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
             // Insufficient funds for this execution attempt - return to scheduled for retry
             currentCall.state = CallState.SCHEDULED;
             emit CallStateChanged(callId, callSnapshot.to, CallState.EXECUTING, CallState.SCHEDULED);
-            uint256 requiredAmount = (effectiveFeePerGas * callSnapshot.gas) + callSnapshot.value + executionFee;
+            uint256 requiredAmount = (effectiveFeePerGas * callSnapshot.gas) + callSnapshot.value;
             uint256 availableAmount = RITUAL_WALLET.availableBalance(callSnapshot.sponsor);
             emit CallSkippedInsufficientFunds(
                 callId, callSnapshot.to, callSnapshot.sponsor, requiredAmount, availableAmount
@@ -1353,6 +1421,15 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         (bool success,) = callSnapshot.to.call{gas: callSnapshot.gas, value: callSnapshot.value}(callbackData);
         uint256 gasUsed = startGas - gasleft();
 
+        // The measured window also contains the CALL opcode envelope (cold access, value surcharge,
+        // stipend), which is not part of the sponsor's callback budget. Clamp so `gasUsed <= gas`
+        // holds for the fee math, the emitted events (which Reth uses as this system tx's block gas
+        // contribution) and the burn/tip split below — otherwise a reverted callback that carried
+        // value would be under-refunded by the envelope and that amount stranded here.
+        if (gasUsed > callSnapshot.gas) {
+            gasUsed = callSnapshot.gas;
+        }
+
         // The scheduled target may have re-entered Scheduler and moved this call
         // by cancelling another slot. Reload by callId before any post-call state
         // transition and discard pre-call storage references.
@@ -1360,7 +1437,7 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
 
         if (!success) {
             // Calculate actual fee using the same effective fee per gas (no value on failure)
-            uint256 actualFailedCallFee = (effectiveFeePerGas * gasUsed) + executionFee;
+            uint256 actualFailedCallFee = effectiveFeePerGas * gasUsed;
 
             // Refund only the value portion and any excess gas fees. A refund failure is a
             // protocol accounting invariant violation for scheduled system transactions, so
@@ -1384,11 +1461,13 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
                 gasUsed,
                 "Execution reverted"
             );
+
+            _distributeGasFees(callId, priorityFee, gasUsed, effectiveFeePerGas * callSnapshot.gas);
             return; // User pays for gas consumed, but value is refunded
         }
 
         // Calculate actual fee using the same effective fee per gas
-        uint256 actualCallFee = (effectiveFeePerGas * gasUsed) + callSnapshot.value + executionFee;
+        uint256 actualCallFee = (effectiveFeePerGas * gasUsed) + callSnapshot.value;
 
         // Refund the difference - sponsor only pays for the actual call. A refund failure is
         // block-invalid for the same protocol-accounting reason as the failure path above.
@@ -1412,26 +1491,56 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
             gasUsed,
             feesPaid
         );
+
+        _distributeGasFees(callId, priorityFee, gasUsed, effectiveFeePerGas * callSnapshot.gas);
     }
 
-    /// @dev Scheduled-async bridge: these consume/evict an index outside `execute()`'s
-    ///      predicate/TTL/payment/target-call flow (`markScheduledAsyncInFlight` shares the same
-    ///      `executedBitmap`; the evict paths free the call). Restricted to trusted senders and bound to
-    ///      `originHash` via `_validateScheduledAsyncOrigin`; commitment validity is enforced in Reth.
+    /// @dev Pay the burn address the base fee and the block proposer the priority-fee tip for gas
+    ///      consumed, funded from the fees already collected from the sponsor and held by this
+    ///      contract. Scheduled transactions are excluded from the execution layer's default
+    ///      EIP-1559 beneficiary reward (see ritual-revm `reward_beneficiary`), so all proposer
+    ///      payment for them is performed here. The combined payout is capped at `gasFeeBudget` so a scheduled
+    ///      call can never pay out more than the sponsor-funded callback gas budget — it can never
+    ///      mint. `priorityFee * gasUsed` is the same tip the default reward would have paid, but
+    ///      metered on the target call's gas rather than the whole system transaction.
+    ///      The tip is credited to the proposer's wallet balance (pull model) rather than pushed
+    ///      to `block.coinbase`, so no proposer-controlled code runs and every proposer payout in
+    ///      the protocol goes through the same wallet mechanism.
+    function _distributeGasFees(uint256 callId, uint256 priorityFee, uint256 gasUsed, uint256 gasFeeBudget) private {
+        uint256 baseFee = block.basefee * gasUsed;
+        if (baseFee > gasFeeBudget) {
+            baseFee = gasFeeBudget;
+        }
+        _burnBaseFee(baseFee);
+        uint256 tip = priorityFee * gasUsed;
+        if (tip > gasFeeBudget - baseFee) {
+            tip = gasFeeBudget - baseFee;
+        }
+        if (tip != 0) {
+            RITUAL_WALLET.creditProposer{value: tip}(block.coinbase, callId);
+        }
+    }
+
+    /// @dev Burn the base-fee portion of consumed callback gas. `BURN_ADDRESS` is codeless, so a
+    ///      failed transfer is a protocol accounting invariant violation and must revert so Reth
+    ///      rejects the block.
+    function _burnBaseFee(uint256 amount) private {
+        if (amount == 0) {
+            return;
+        }
+        (bool burned,) = BURN_ADDRESS.call{value: amount}("");
+        if (!burned) {
+            revert BaseFeeBurnFailed();
+        }
+    }
+
+    /// @dev Validates and records AsyncJobTracker admission without consuming the Scheduler bitmap.
+    ///      Reth suppresses duplicate commitments while the async job is active.
     function markScheduledAsyncInFlight(uint256 callId, uint256 executionIndex, bytes32 jobId) external {
         _onlyAsyncJobTracker();
         Call storage call = _getCall(callId);
         _validateScheduledAsyncPending(callId, call, executionIndex, jobId);
         emit ScheduledAsyncInFlight(callId, executionIndex, jobId);
-    }
-
-    function evictScheduledAsync(uint256 callId, uint256 executionIndex, bytes32 jobId, bytes32 reason) external {
-        _onlyAsyncJobTracker();
-        Call storage call = _getCall(callId);
-        _validateScheduledAsyncPending(callId, call, executionIndex, jobId);
-        scheduledAsyncReserveFailures[_scheduledAsyncKey(callId, executionIndex)] = reason;
-        _evictInsufficientFunds(callId, call, 0, 0);
-        emit ScheduledAsyncEvicted(callId, executionIndex, jobId, reason);
     }
 
     function cleanupInvalidScheduledAsync(uint256 callId, uint256 executionIndex, bytes32 jobId, bytes32 reason)
@@ -1442,19 +1551,17 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         }
         Call storage call = _getCall(callId);
         _validateScheduledAsyncPending(callId, call, executionIndex, jobId);
-        scheduledAsyncReserveFailures[_scheduledAsyncKey(callId, executionIndex)] = reason;
-        _evictInsufficientFunds(callId, call, 0, 0);
+        scheduledAsyncCleanupReasons[_scheduledAsyncKey(callId, executionIndex)] = reason;
+        _cancelScheduledCall(callId, call);
         emit ScheduledAsyncEvicted(callId, executionIndex, jobId, reason);
     }
 
-    function scheduledAsyncReserveFailure(uint256 callId, uint256 executionIndex) external view returns (bytes32) {
-        return scheduledAsyncReserveFailures[_scheduledAsyncKey(callId, executionIndex)];
+    function scheduledAsyncCleanupReason(uint256 callId, uint256 executionIndex) external view returns (bytes32) {
+        return scheduledAsyncCleanupReasons[_scheduledAsyncKey(callId, executionIndex)];
     }
 
     /// @notice Expire a single SCHEDULED call and release all of its storage
-    /// @dev Shared terminal cleanup for both the scan-all and explicit-id paths. Assumes the caller has
-    ///      already confirmed the call is expired. After `_freeSlot` the freed slot index is reused by the
-    ///      swapped-in call, so scan callers must not advance their cursor past this index.
+    /// @dev Assumes the caller has already confirmed the call is expired.
     function _expireCall(uint256 callId, uint256 slotIndex, Call storage call, uint256 expiryBlock) internal {
         _clearBitmap(callId);
 
@@ -1472,45 +1579,32 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         delete callPredicates[callId];
     }
 
-    /// @notice Scan the dense slots array and expire any calls past their implicit expiry
-    /// @dev Gas-bounded by MAX_CLEANUP_PER_EXECUTE. Used by the privileged execute() opportunistic sweep.
-    function _cleanupExpiredCallsScan() internal {
-        uint256 cleaned = 0;
-        for (uint256 i = 0; i < slots.length && cleaned < MAX_CLEANUP_PER_EXECUTE;) {
-            Call storage call = slots[i];
-            if (call.to != address(0) && call.state == CallState.SCHEDULED) {
+    /// @notice Expire one explicitly selected call if it is past its implicit expiry.
+    /// @dev Missing, terminal, unexpired, and non-SCHEDULED call IDs are idempotent no-ops.
+    function _cleanupExpiredCallById(uint256 callId) internal {
+        uint256 slotIndex = callToSlot[callId];
+        if (slotIndex < slots.length) {
+            Call storage call = slots[slotIndex];
+            if (call.callId == callId && call.to != address(0)) {
                 uint256 expiryBlock = _calculateExpiryBlock(call.startBlock, call.frequency, call.numCalls, call.ttl);
-                if (block.number > expiryBlock) {
-                    _expireCall(call.callId, i, call, expiryBlock);
-                    // Slot was freed, so current index now points to a different call
-                    // Continue without incrementing to check the new call at this index
-                    cleaned++;
-                    continue;
+                if (block.number > expiryBlock && call.state == CallState.SCHEDULED) {
+                    _expireCall(callId, slotIndex, call, expiryBlock);
                 }
-            }
-            unchecked {
-                ++i;
             }
         }
     }
 
-    /// @notice Expire the given call IDs if they are past their implicit expiry
-    /// @dev Iterates `callIds` directly in calldata (no memory copy); caller controls gas via array size.
-    function _cleanupExpiredCallsByIds(uint256[] calldata callIds) internal {
+    /// @notice Expire the given call IDs if they are past their implicit expiry.
+    /// @param protectedCallId Call ID to skip when `protectCallId` is true.
+    /// @param protectCallId Whether to leave `protectedCallId` for subsequent execution.
+    function _cleanupExpiredCallsByIds(uint256[] calldata callIds, uint256 protectedCallId, bool protectCallId)
+        internal
+    {
         uint256 n = callIds.length;
         for (uint256 i = 0; i < n;) {
-            uint256 callId = callIds[i];
-            uint256 slotIndex = callToSlot[callId];
-            if (slotIndex < slots.length) {
-                Call storage call = slots[slotIndex];
-                if (call.callId == callId && call.to != address(0)) {
-                    // Check if call is expired (implicit expiry)
-                    uint256 expiryBlock =
-                        _calculateExpiryBlock(call.startBlock, call.frequency, call.numCalls, call.ttl);
-                    if (block.number > expiryBlock && call.state == CallState.SCHEDULED) {
-                        _expireCall(callId, slotIndex, call, expiryBlock);
-                    }
-                }
+            uint256 cleanupCallId = callIds[i];
+            if (!protectCallId || cleanupCallId != protectedCallId) {
+                _cleanupExpiredCallById(cleanupCallId);
             }
             unchecked {
                 ++i;
@@ -1518,14 +1612,13 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         }
     }
 
-    /// @notice Clean up expired calls (external wrapper)
-    /// @param callIds Array of call IDs to check and clean up if expired. If empty, scans all slots.
+    /// @notice Clean up caller-supplied expired calls by explicit ID
+    /// @param callIds Explicit call IDs to check and clean up if expired
     function cleanupExpiredCalls(uint256[] calldata callIds) external {
         if (callIds.length == 0) {
-            _cleanupExpiredCallsScan();
-        } else {
-            _cleanupExpiredCallsByIds(callIds);
+            revert InvalidCleanupBatchSize();
         }
+        _cleanupExpiredCallsByIds(callIds, 0, false);
     }
 
     /// @notice Get the current state of a call
@@ -1581,16 +1674,13 @@ contract Scheduler is Initializable, UUPSUpgradeable, OwnableUpgradeable {
     /// @notice Allow ETH deposits to `Scheduler`
     receive() external payable {}
 
-    /// @notice Configured non-refundable fee charged for each scheduled execution.
-    uint256 private _scheduledExecutionFee;
-
-    /// @notice Whether `_scheduledExecutionFee` has been explicitly initialized or set.
-    bool private _scheduledExecutionFeeSet;
+    /// @notice Non-refundable admission fee charged per block of scheduled slot residency.
+    uint256 public SCHEDULED_RESIDENCY_FEE_PER_BLOCK = 10_000_000_000_000_000;
 
     /*//////////////////////////////////////////////////////////////
                             STORAGE GAP
     //////////////////////////////////////////////////////////////*/
 
     /// @dev Reserved storage space for future upgrades
-    uint256[44] private __gap;
+    uint256[45] private __gap;
 }

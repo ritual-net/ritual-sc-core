@@ -29,7 +29,7 @@ contract AsyncJobTracker is Initializable, UUPSUpgradeable, OwnableUpgradeable {
     uint256 public constant CLEANUP_INTERVAL = 30;
     uint256 public constant MAX_CLEANUP_BUCKETS = 64;
 
-    /// @dev Maximum items to clean per cleanup call (gas bound: 25 × ~280K = 7M gas)
+    /// @dev Caps the number of jobs removed per cleanup call to bound gas usage.
     uint256 public constant MAX_CLEANUP_PER_CALL = 25;
 
     // REQUIREMENT: 10KB input limit (FHE with DA layer requires ~7KB for encrypted storage credentials)
@@ -67,10 +67,6 @@ contract AsyncJobTracker is Initializable, UUPSUpgradeable, OwnableUpgradeable {
 
     // Persistent Agent precompile (0x0820) - spawns OpenClaw AI agent instances via claw-spawner
     address public constant PERSISTENT_AGENT_PRECOMPILE = 0x0000000000000000000000000000000000000820;
-
-    bytes32 public constant SCHEDULED_INVALID_EXECUTOR_REASON = keccak256("SCHEDULED_INVALID_EXECUTOR");
-    bytes32 public constant SCHEDULED_INVALID_EXECUTOR_CAPABILITY_REASON =
-        keccak256("SCHEDULED_INVALID_EXECUTOR_CAPABILITY");
 
     /// @dev Maximum TTL (time-to-live) allowed for async commitments in blocks.
     /// Must match the reth-side DEFAULT_MAX_TTL_BLOCKS in ritual-async-inspector.
@@ -202,7 +198,6 @@ contract AsyncJobTracker is Initializable, UUPSUpgradeable, OwnableUpgradeable {
     struct ReserveConfig {
         address sponsor;
         uint256 reserveAmount;
-        uint64 reserveExpiryBlock;
         bytes32[] expiredEscrows;
     }
 
@@ -253,15 +248,6 @@ contract AsyncJobTracker is Initializable, UUPSUpgradeable, OwnableUpgradeable {
     event ScheduledAsyncCommitted(
         uint256 indexed callId, uint256 indexed executionIndex, bytes32 indexed jobId, address sponsor, address caller
     );
-    event ScheduledAsyncEvicted(
-        uint256 indexed callId,
-        uint256 indexed executionIndex,
-        bytes32 indexed jobId,
-        address sponsor,
-        address caller,
-        bytes32 reason
-    );
-
     // Long-running job events
     event Phase1Settled(bytes32 indexed jobId, address indexed executor, uint256 settledBlock);
     event ResultDelivered(bytes32 indexed jobId, address indexed target, bool success);
@@ -275,16 +261,12 @@ contract AsyncJobTracker is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         _validateExecutor(job.exec, job.precomp);
 
         require(address(ritualWallet) != address(0), "wallet not set");
+        uint64 exp = uint64(block.number + job.ttl);
         ritualWallet.reserveFrom(
-            reserve.sponsor,
-            job.caller,
-            job.id,
-            reserve.reserveAmount,
-            reserve.reserveExpiryBlock,
-            reserve.expiredEscrows
+            reserve.sponsor, job.caller, job.id, reserve.reserveAmount, exp, reserve.expiredEscrows
         );
 
-        _storeReservedJob(job);
+        _storeReservedJob(job, exp);
     }
 
     function addScheduledJobAndReserve(
@@ -294,44 +276,21 @@ contract AsyncJobTracker is Initializable, UUPSUpgradeable, OwnableUpgradeable {
     ) external onlyCommitmentCaller {
         require(scheduler != address(0), "scheduler not set");
         require(schedule.scheduledOriginHash != bytes32(0), "empty scheduled origin");
-        require(schedule.scheduledOriginHash == job.origHash, "scheduled origin mismatch");
         require(schedule.scheduledOriginHash == job.id, "scheduled job mismatch");
         require(job.txOrigin == address(0), "scheduled txOrigin set");
 
         _prepareJob(job);
-
-        bytes32 invalidExecutorReason = _scheduledExecutorInvalidReason(job.exec, job.precomp);
-        if (invalidExecutorReason != bytes32(0)) {
-            ISchedulerAsyncBridge(scheduler)
-                .evictScheduledAsync(schedule.callId, schedule.executionIndex, job.id, invalidExecutorReason);
-            emit ScheduledAsyncEvicted(
-                schedule.callId, schedule.executionIndex, job.id, reserve.sponsor, job.caller, invalidExecutorReason
-            );
-            return;
-        }
+        _validateExecutor(job.exec, job.precomp);
 
         require(address(ritualWallet) != address(0), "wallet not set");
-        (bool ok, IRitualWallet.ReserveFailure reason) = ritualWallet.tryReserveFrom(
-            reserve.sponsor,
-            job.caller,
-            job.id,
-            reserve.reserveAmount,
-            reserve.reserveExpiryBlock,
-            reserve.expiredEscrows
+        uint64 exp = uint64(block.number + job.ttl);
+        ritualWallet.reserveFrom(
+            reserve.sponsor, job.caller, job.id, reserve.reserveAmount, exp, reserve.expiredEscrows
         );
 
-        if (ok) {
-            _storeReservedJob(job);
-            ISchedulerAsyncBridge(scheduler)
-                .markScheduledAsyncInFlight(schedule.callId, schedule.executionIndex, job.id);
-            emit ScheduledAsyncCommitted(schedule.callId, schedule.executionIndex, job.id, reserve.sponsor, job.caller);
-        } else {
-            ISchedulerAsyncBridge(scheduler)
-                .evictScheduledAsync(schedule.callId, schedule.executionIndex, job.id, bytes32(uint256(reason)));
-            emit ScheduledAsyncEvicted(
-                schedule.callId, schedule.executionIndex, job.id, reserve.sponsor, job.caller, bytes32(uint256(reason))
-            );
-        }
+        _storeReservedJob(job, exp);
+        ISchedulerAsyncBridge(scheduler).markScheduledAsyncInFlight(schedule.callId, schedule.executionIndex, job.id);
+        emit ScheduledAsyncCommitted(schedule.callId, schedule.executionIndex, job.id, reserve.sponsor, job.caller);
     }
 
     function setScheduler(address _scheduler) external onlyOwner {
@@ -357,7 +316,7 @@ contract AsyncJobTracker is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         _validateDeliveryFees(job.input, job.precomp);
     }
 
-    function _storeReservedJob(AddJobInput calldata job) internal {
+    function _storeReservedJob(AddJobInput calldata job, uint64 exp) internal {
         uint256 createdAt = block.timestamp;
 
         Job storage j = jobs[job.id];
@@ -380,7 +339,6 @@ contract AsyncJobTracker is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         txRlpHashes[job.id] = keccak256(job.origRlp);
         txRlpSizes[job.id] = job.origRlp.length;
 
-        uint256 exp = block.number + job.ttl;
         expiryBuckets[exp].push(job.id);
         bucketIndex[job.id] = expiryBuckets[exp].length - 1;
         expiryBlock[job.id] = exp;
@@ -417,43 +375,20 @@ contract AsyncJobTracker is Initializable, UUPSUpgradeable, OwnableUpgradeable {
             return;
         }
 
+        // getValidService reverts unless the attestation is valid, so a successful
+        // return already guarantees context.isValid; only capability needs checking.
         ITEEServiceRegistry.TEEServiceContext memory context;
-        try TEE_SERVICE_REGISTRY.getService(executor) returns (ITEEServiceRegistry.TEEServiceContext memory result) {
+        try TEE_SERVICE_REGISTRY.getValidService(executor) returns (
+            ITEEServiceRegistry.TEEServiceContext memory result
+        ) {
             context = result;
         } catch {
-            revert InvalidExecutor(executor);
-        }
-
-        if (!context.isValid) {
             revert InvalidExecutor(executor);
         }
 
         if (!_capabilityMatchesPrecompile(precompile, context.node.capability)) {
             revert InvalidExecutorCapability(executor, precompile, context.node.capability);
         }
-    }
-
-    function _scheduledExecutorInvalidReason(address executor, address precompile) internal view returns (bytes32) {
-        if (address(TEE_SERVICE_REGISTRY) == address(0) || !_isKnownAsyncPrecompile(precompile)) {
-            return bytes32(0);
-        }
-
-        ITEEServiceRegistry.TEEServiceContext memory context;
-        try TEE_SERVICE_REGISTRY.getService(executor) returns (ITEEServiceRegistry.TEEServiceContext memory result) {
-            context = result;
-        } catch {
-            return SCHEDULED_INVALID_EXECUTOR_REASON;
-        }
-
-        if (!context.isValid) {
-            return SCHEDULED_INVALID_EXECUTOR_REASON;
-        }
-
-        if (!_capabilityMatchesPrecompile(precompile, context.node.capability)) {
-            return SCHEDULED_INVALID_EXECUTOR_CAPABILITY_REASON;
-        }
-
-        return bytes32(0);
     }
 
     /// @notice Remove a job after settlement
@@ -489,7 +424,7 @@ contract AsyncJobTracker is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         // the executor attestation and capability policy valid.
         // Ritual reth checks the executor is valid at job commitment, but we conservatively
         // do not allow settlement if the executor became invalid in the interim.
-        ITEEServiceRegistry.TEEServiceContext memory context = TEE_SERVICE_REGISTRY.getService(executorTeeAddress);
+        ITEEServiceRegistry.TEEServiceContext memory context = TEE_SERVICE_REGISTRY.getValidService(executorTeeAddress);
         executorPaymentAddress = context.node.paymentAddress;
         require(executorPaymentAddress != address(0), "executor payment not found");
     }
@@ -852,6 +787,7 @@ contract AsyncJobTracker is Initializable, UUPSUpgradeable, OwnableUpgradeable {
             maxPriorityFee := calldataload(add(input.offset, maxPriorityFeeOffset))
         }
 
+        require(gasLimit > 0, "delivery gasLimit is zero");
         require(gasLimit <= type(uint64).max, "delivery gasLimit exceeds u64");
         require(maxFee <= type(uint128).max, "maxFeePerGas exceeds u128");
         require(maxPriorityFee <= type(uint128).max, "maxPriorityFeePerGas exceeds u128");
@@ -922,6 +858,12 @@ contract AsyncJobTracker is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         address exec = jobExecutor[id];
         if (exec == address(0)) {
             return false;
+        }
+
+        // Settlement and prior permissionless cleanup legitimately leave no escrow.
+        // Any escrow still present must be expired; strict expiry exposes deadline drift.
+        if (ritualWallet.escrows(id).sponsor != address(0)) {
+            ritualWallet.expire(id);
         }
 
         // Remove from expiry bucket (swap-and-pop)

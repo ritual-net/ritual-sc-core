@@ -306,11 +306,13 @@ interface ITEEServiceRegistry {
 
     // ============ Generic Service Queries ============
 
-    /// @notice Get service context for an address (checks validity by default)
-    /// @dev Reverts with AttestationInvalid if the service's attestation is no longer valid
+    /// @notice Get service context for an address, guaranteed to have a valid attestation
+    /// @dev Equivalent to `getService(addr, true)`. Reverts with AttestationInvalid if the
+    ///      service's attestation is no longer valid; use `getService(addr, checkValidity)`
+    ///      for explicit control. Validity covers attestation only, not capability.
     /// @param addr The TEE address of the service
     /// @return context The service context (guaranteed valid attestation)
-    function getService(address addr) external view returns (TEEServiceContext memory context);
+    function getValidService(address addr) external view returns (TEEServiceContext memory context);
 
     /// @notice Get service context for an address with explicit validity check control
     /// @dev When checkValidity=false, returns service even if attestation is invalid - caller must check isValid!

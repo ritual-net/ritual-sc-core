@@ -26,6 +26,7 @@ contract AsyncDelivery is Initializable, UUPSUpgradeable, OwnableUpgradeable {
 
     /// @notice Async settlement system sender address
     address public constant ASYNC_SETTLEMENT_SYSTEM_SENDER = 0x000000000000000000000000000000000000fA9E;
+    address private constant BURN_ADDRESS = 0x000000000000000000000000000000000000dEaD;
 
     /*//////////////////////////////////////////////////////////////
                               IMMUTABLE
@@ -71,6 +72,7 @@ contract AsyncDelivery is Initializable, UUPSUpgradeable, OwnableUpgradeable {
 
     /// @notice Only settlement system can call this
     error OnlySettlementSystem();
+    error BaseFeeBurnFailed();
 
     /*//////////////////////////////////////////////////////////////
                                MODIFIERS
@@ -256,7 +258,35 @@ contract AsyncDelivery is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         // STEP 4: Mark job as delivered in tracker (SC-2: pass precompileInput for hash verification)
         ASYNC_JOB_TRACKER.markDelivered(jobId, precompileInput, success);
 
+        uint256 baseFee = block.basefee * gasConsumed;
+        if (baseFee > callbackGasBudget) {
+            baseFee = callbackGasBudget;
+        }
+        _burnBaseFee(baseFee);
+        uint256 tip = (effectiveFeePerGas - block.basefee) * gasConsumed;
+        if (tip > callbackGasBudget - baseFee) {
+            tip = callbackGasBudget - baseFee;
+        }
+        if (tip != 0) {
+            // Pull-model proposer payout: credit the tip to the proposer's wallet balance rather
+            // than pushing to block.coinbase, so no proposer-controlled code runs here and all
+            // proposer payments (schedule residency, settle inclusion fee, tips) use one mechanism.
+            RITUAL_WALLET.creditProposer{value: tip}(block.coinbase, uint256(jobId));
+        }
         emit Delivered(jobId, sponsor, target, success, gasConsumed, gasRefunded, valueRefunded);
+    }
+
+    /// @dev Burn the base-fee portion of consumed callback gas. `BURN_ADDRESS` is codeless, so a
+    ///      failed transfer is a protocol accounting invariant violation and must revert so Reth
+    ///      rejects the block.
+    function _burnBaseFee(uint256 amount) private {
+        if (amount == 0) {
+            return;
+        }
+        (bool burned,) = BURN_ADDRESS.call{value: amount}("");
+        if (!burned) {
+            revert BaseFeeBurnFailed();
+        }
     }
 
     /*//////////////////////////////////////////////////////////////

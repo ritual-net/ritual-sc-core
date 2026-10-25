@@ -11,13 +11,17 @@ Three reserved system accounts come up throughout, and the node itself sends tra
 
 | Contract | Path | Code lines | Driven by |
 | --- | --- | --- | --- |
-| Scheduler | [`src/scheduler/Scheduler.sol`](src/scheduler/Scheduler.sol) | 924 | `0x…fa7e` |
-| RitualWallet | [`src/wallet/RitualWallet.sol`](src/wallet/RitualWallet.sol) | 359 | Scheduler, AsyncDelivery, AsyncJobTracker |
-| AsyncJobTracker | [`src/async/AsyncJobTracker.sol`](src/async/AsyncJobTracker.sol) | 769 | `0x…Fa8e` |
-| AsyncDelivery | [`src/async/AsyncDelivery.sol`](src/async/AsyncDelivery.sol) | 125 | `0x…fA9E` |
-| AgentHeartbeat | [`src/heartbeat/AgentHeartbeat.sol`](src/heartbeat/AgentHeartbeat.sol) | 434 | `0x…fa7e` |
+| Scheduler | [`src/scheduler/Scheduler.sol`](src/scheduler/Scheduler.sol) | 1,686 | `0x…fa7e` |
+| RitualWallet | [`src/wallet/RitualWallet.sol`](src/wallet/RitualWallet.sol) | 494 | Scheduler, AsyncDelivery, AsyncJobTracker |
+| AsyncJobTracker | [`src/async/AsyncJobTracker.sol`](src/async/AsyncJobTracker.sol) | 1,060 | `0x…Fa8e` |
+| AsyncDelivery | [`src/async/AsyncDelivery.sol`](src/async/AsyncDelivery.sol) | 322 | `0x…fA9E` |
+| AgentHeartbeat | [`src/heartbeat/AgentHeartbeat.sol`](src/heartbeat/AgentHeartbeat.sol) | 616 | `0x…fa7e` |
 
-The interfaces these contracts import are included alongside them (`IRitualWallet`, `IAsyncJobTracker`, `IAgentHeartbeat`, the scheduler callback/predicate/bridge interfaces, and the TEE registry interfaces), since the structs, enums, and API documentation live there. This is a reading repo, not a build target: there is no `foundry.toml` or `lib/`, so OpenZeppelin and flashtestations imports will not resolve.
+The interfaces these contracts import are included alongside them (`IRitualWallet`, `IAsyncJobTracker`, `IAgentHeartbeat`, the scheduler callback/predicate/bridge interfaces, and the TEE registry interfaces), since the structs, enums, and API documentation live there.
+
+## Tests
+
+The repository includes the audit-scope Foundry harness and pinned dependencies. Run `git submodule update --init --recursive`, then `forge test`.
 
 ---
 
