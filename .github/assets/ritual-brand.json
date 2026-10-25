@@ -1,0 +1,43 @@
+{
+  "identity": {
+    "source": "https://form-atlas-8e31.vercel.app/assets/static-kit/svg/ritual-lockup-ivory.svg",
+    "sha256": "4ee7c5d53396e3faf510cd4a0d889cefb78aaf942b540129d22e2f0edaaa74a3",
+    "usage": "Original path geometry and ivory fill; uniformly scaled only."
+  },
+  "motion": {
+    "source": "https://form-atlas-8e31.vercel.app/review/motion-kit/2.5/ritual-2.5-shader-study-threads-lacquer-asagi-1920x1080p60.mp4",
+    "sourceSha256": "8504aee44c12576d701b7a8aa67fcc7ba19dab4601c4d91b45b462ca8f0a6bcb",
+    "gifSha256": "080edd895dc45de16006dfd1b4750ecfbdda9847549c0b2218c034d4e926b491",
+    "derivative": "Text-free lower band, seconds 1–3, 960x110 at 10fps; forward/reverse loop. Header still uses the text-free lower band at second 8."
+  },
+  "palette": {
+    "source": "https://form-atlas-8e31.vercel.app/assets/tokens/ritual-tokens.json",
+    "ink": "#0E0F0E",
+    "ivory": "#F5F0E8",
+    "green": "#1A6B4A",
+    "neon": "#40FFAF"
+  },
+  "type": {
+    "source": "https://form-atlas-8e31.vercel.app/assets/fonts/bakeoff2/fs-switzer/switzer-100_900.woff2",
+    "sha256": "d1bf801ffb1a6096def70a7c532255722ad87d948b13a8a586e342f7091f8ee4",
+    "usage": "Switzer rendered into header PNGs; SVG sources fall back to Arial/Helvetica when unavailable."
+  },
+  "reference": "https://github.com/ritual-net/security-audits",
+  "rights": "Ritual branding and third-party source assets retain their original rights and notices; software license statements in README.md are unchanged.",
+  "headerRendering": {
+    "pixelScale": 3,
+    "desktopPixels": [
+      3600,
+      1020
+    ],
+    "mobilePixels": [
+      2160,
+      1170
+    ],
+    "format": "RGBA PNG",
+    "transparentRoundedCorners": true
+  },
+  "repository": "ritual-net/ritual-sc-core",
+  "headerTitle": "Core Contracts",
+  "reusedDesign": "Approved Ritual README presentation; root prose preserved except prior ZK/FHE exclusion."
+}
