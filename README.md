@@ -1,7 +1,23 @@
-# Ritual Core Protocol Contracts
+<p align="center">
+  <picture>
+    <source media="(max-width: 600px)" srcset=".github/assets/ritual-header-mobile.png">
+    <img src=".github/assets/ritual-header.png" width="1200" alt="Ritual Core Protocol Contracts — scheduling, async delivery, and agent liveness">
+  </picture>
+</p>
 
-[![Solidity](https://img.shields.io/badge/Solidity-0.8.28-e6e6e6?logo=solidity)](https://docs.soliditylang.org/)
-[![License](https://img.shields.io/badge/License-Clear%20BSD-blue.svg)](#license)
+<p align="center">
+  <a href="foundry.toml"><img src="https://img.shields.io/badge/Solidity-0.8.28-1A6B4A?style=flat-square&amp;labelColor=0E0F0E&amp;logo=solidity&amp;logoColor=F5F0E8" alt="Solidity: 0.8.28"></a>
+  <a href="#tests"><img src="https://img.shields.io/badge/build-Foundry-1A6B4A?style=flat-square&amp;labelColor=0E0F0E" alt="build: Foundry"></a>
+  <a href="#license"><img src="https://img.shields.io/badge/license-Clear%20BSD-1A6B4A?style=flat-square&amp;labelColor=0E0F0E" alt="license: Clear BSD"></a>
+</p>
+
+<p align="center">
+  <a href="#overview">Overview</a> &middot; <a href="#contracts">Contracts</a> &middot; <a href="#tests">Tests</a> &middot; <a href="#license">License</a>
+</p>
+
+---
+
+## Overview
 
 These are basically the core five contracts at the center of Ritual's chain features: scheduling, payment, async job tracking, settlement, and agent liveness.
 
@@ -39,7 +55,7 @@ The repository includes the audit-scope Foundry harness and pinned dependencies.
 
 ## AsyncJobTracker
 
-- **What it is.** It tracks off-chain work that's still in flight: HTTP calls, LLM runs, ZK and FHE jobs, media generation, agent spawns. Each job keeps an entry here until an executor finishes it or it expires.
+- **What it is.** It tracks off-chain work that's still in flight: HTTP calls, LLM runs, media generation, agent spawns. Each job keeps an entry here until an executor finishes it or it expires.
 - **How it works.** The commitment account (`0x…Fa8e`) files jobs through `addJobAndReserve`, which checks the executor against the TEE registry, enforces input ≤ 10KB and TTL ≤ 500 blocks, and locks wallet escrow in the same call. It stores only keccak hashes of the inputs; the full bytes come back as calldata and get re-hashed at every later step. Jobs are bucketed by expiry block so cleanup stays cheap.
 - **Some design notes.** All of its structures are bounded: 10k pending jobs, 25 removals per cleanup pass, O(1) index updates via swap-and-pop. It assumes reth already validated the commitment before filing it. The delivery-fee parsing mirrors reth's ABI layouts at hardcoded byte offsets, and the two are only kept in sync by hand.
 
@@ -60,3 +76,12 @@ The repository includes the audit-scope Foundry harness and pinned dependencies.
 ## License
 
 The source contracts are licensed under the Clear BSD License (`BSD-3-Clause-Clear`).
+
+---
+
+<p align="center">
+  <picture>
+    <source media="(prefers-reduced-motion: reduce)" srcset=".github/assets/ritual-threads-still.jpg">
+    <img src=".github/assets/ritual-threads.gif" width="960" alt="Decorative flowing threads from Ritual's motion library">
+  </picture>
+</p>
